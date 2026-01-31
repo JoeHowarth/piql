@@ -673,7 +673,6 @@ fn none_literal_in_fill_null() {
 }
 
 #[test]
-#[ignore = "multiple partition columns not yet supported"]
 fn over_multiple_columns() {
     let df = df! {
         "a" => &["x", "x", "y", "y"],
@@ -692,7 +691,6 @@ fn over_multiple_columns() {
 }
 
 #[test]
-#[ignore = "multiple join columns not yet supported"]
 fn join_multiple_columns() {
     let left = df! {
         "a" => &[1, 1, 2],
@@ -714,6 +712,44 @@ fn join_multiple_columns() {
         .with_df("left", left)
         .with_df("right", right);
 
-    // Would need: on=["a", "b"] syntax
     let _result = run_to_df(r#"left.join(right, on=["a", "b"])"#, &ctx);
+}
+
+// ============ String escapes ============
+
+#[test]
+fn string_escape_sequences() {
+    let df = df! {
+        "text" => &["hello\nworld", "tab\there", "quote\"test"],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+
+    // Filter for string containing newline
+    let result = run_to_df(
+        r#"df.filter(pl.col("text").str.starts_with("hello\nw"))"#,
+        &ctx,
+    );
+    assert_eq!(result.height(), 1);
+}
+
+#[test]
+fn string_with_escaped_quote() {
+    let df = df! {
+        "name" => &["test"],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+
+    // Use escaped quote in string literal
+    let result = run_to_df(
+        r#"df.with_columns(pl.lit("say \"hello\"").alias("greeting"))"#,
+        &ctx,
+    );
+    let greeting = result.column("greeting").unwrap().str().unwrap();
+    assert_eq!(greeting.get(0).unwrap(), "say \"hello\"");
 }

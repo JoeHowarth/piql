@@ -206,8 +206,12 @@ fn eval_method_call(
 fn eval_pl_function(name: &str, args: &[CoreArg], ctx: &EvalContext) -> Result<Value> {
     match name {
         "col" => {
-            let col_name = get_string_arg(args, 0, "col")?;
-            Ok(Value::Expr(col(&col_name)))
+            let col_names = collect_string_args(args)?;
+            if col_names.len() == 1 {
+                Ok(Value::Expr(col(&col_names[0])))
+            } else {
+                Ok(Value::Expr(cols(col_names)))
+            }
         }
         "lit" => {
             let val = get_positional_arg(args, 0, "lit")?;
@@ -251,10 +255,10 @@ fn eval_df_method(
             Ok(Value::DataFrame(df.limit(n)))
         }
         "sort" => {
-            let col_name = get_string_arg(args, 0, "sort")?;
+            let col_names = get_strings_arg(args, 0, "sort")?;
             let descending = get_kwarg_bool(args, "descending").unwrap_or(false);
             let opts = SortMultipleOptions::new().with_order_descending(descending);
-            Ok(Value::DataFrame(df.sort([&col_name], opts)))
+            Ok(Value::DataFrame(df.sort(&col_names, opts)))
         }
         "tail" => {
             let n = get_int_arg(args, 0, "tail").unwrap_or(10) as u32;
@@ -320,28 +324,26 @@ fn eval_df_method(
                 _ => return Err(EvalError::ArgError(format!("Unknown join type: {how}"))),
             };
 
-            // Get join columns
-            let result = if let Some(on) = get_kwarg_string(args, "on") {
-                // Same column name on both sides
-                df.join(other, [col(&on)], [col(&on)], JoinArgs::new(join_type))
+            // Get join columns - supports single string or list
+            let result = if let Some(on_cols) = get_kwarg_strings(args, "on") {
+                // Same column name(s) on both sides
+                let on_exprs: Vec<_> = on_cols.iter().map(col).collect();
+                df.join(other, on_exprs.clone(), on_exprs, JoinArgs::new(join_type))
             } else {
                 // Different column names
-                let left_on = get_kwarg_string(args, "left_on").ok_or_else(|| {
+                let left_cols = get_kwarg_strings(args, "left_on").ok_or_else(|| {
                     EvalError::ArgError(
                         "join() requires 'on' or 'left_on'/'right_on' kwargs".to_string(),
                     )
                 })?;
-                let right_on = get_kwarg_string(args, "right_on").ok_or_else(|| {
+                let right_cols = get_kwarg_strings(args, "right_on").ok_or_else(|| {
                     EvalError::ArgError(
                         "join() requires 'right_on' when 'left_on' is specified".to_string(),
                     )
                 })?;
-                df.join(
-                    other,
-                    [col(&left_on)],
-                    [col(&right_on)],
-                    JoinArgs::new(join_type),
-                )
+                let left_exprs: Vec<_> = left_cols.iter().map(col).collect();
+                let right_exprs: Vec<_> = right_cols.iter().map(col).collect();
+                df.join(other, left_exprs, right_exprs, JoinArgs::new(join_type))
             };
 
             Ok(Value::DataFrame(result))
@@ -383,8 +385,9 @@ fn eval_expr_method(
             Ok(Value::Expr(e.alias(&name)))
         }
         "over" => {
-            let partition = get_string_arg(args, 0, "over")?;
-            Ok(Value::Expr(e.over([col(&partition)])))
+            let partition_cols = get_strings_arg(args, 0, "over")?;
+            let partition_exprs: Vec<_> = partition_cols.iter().map(col).collect();
+            Ok(Value::Expr(e.over(partition_exprs)))
         }
         "is_between" => {
             let low = eval_to_expr(get_positional_arg(args, 0, "is_between")?, ctx)?;
@@ -626,6 +629,29 @@ fn get_string_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<String>
     }
 }
 
+/// Get a positional arg that can be either a single string or a list of strings
+fn get_strings_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<Vec<String>> {
+    let expr = get_positional_arg(args, idx, fn_name)?;
+    match expr {
+        Expr::Literal(Literal::String(s)) => Ok(vec![s.clone()]),
+        Expr::List(items) => items
+            .iter()
+            .map(|e| {
+                if let Expr::Literal(Literal::String(s)) = e {
+                    Ok(s.clone())
+                } else {
+                    Err(EvalError::ArgError(format!(
+                        "{fn_name}() argument {idx} must be a string or list of strings"
+                    )))
+                }
+            })
+            .collect(),
+        _ => Err(EvalError::ArgError(format!(
+            "{fn_name}() argument {idx} must be a string or list of strings"
+        ))),
+    }
+}
+
 fn get_int_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<i64> {
     let expr = get_positional_arg(args, idx, fn_name)?;
     if let Expr::Literal(Literal::Int(n)) = expr {
@@ -641,9 +667,10 @@ fn get_kwarg_bool(args: &[CoreArg], name: &str) -> Option<bool> {
     for arg in args {
         if let Arg::Keyword(k, v) = arg
             && k == name
-                && let Expr::Literal(Literal::Bool(b)) = v {
-                    return Some(*b);
-                }
+            && let Expr::Literal(Literal::Bool(b)) = v
+        {
+            return Some(*b);
+        }
     }
     None
 }
@@ -652,9 +679,37 @@ fn get_kwarg_string(args: &[CoreArg], name: &str) -> Option<String> {
     for arg in args {
         if let Arg::Keyword(k, v) = arg
             && k == name
-                && let Expr::Literal(Literal::String(s)) = v {
-                    return Some(s.clone());
+            && let Expr::Literal(Literal::String(s)) = v
+        {
+            return Some(s.clone());
+        }
+    }
+    None
+}
+
+/// Get a kwarg that can be either a single string or a list of strings
+fn get_kwarg_strings(args: &[CoreArg], name: &str) -> Option<Vec<String>> {
+    for arg in args {
+        if let Arg::Keyword(k, v) = arg
+            && k == name {
+                match v {
+                    Expr::Literal(Literal::String(s)) => return Some(vec![s.clone()]),
+                    Expr::List(items) => {
+                        let strings: Option<Vec<_>> = items
+                            .iter()
+                            .map(|e| {
+                                if let Expr::Literal(Literal::String(s)) = e {
+                                    Some(s.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        return strings;
+                    }
+                    _ => return None,
                 }
+            }
     }
     None
 }

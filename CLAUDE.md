@@ -46,8 +46,8 @@ The surface/core AST split exists for future sugar expansion:
 Transform pass handles pattern recognition (e.g., when/then/otherwise chains).
 Future: add sugar variants to surface::Expr, expand in transform().
 
-## Known Gaps
+## Supported Syntax
 
-- Multi-column kwargs: `on=["a", "b"]`, `over(["a", "b"])`
-- String escapes: `\n`, `\"`
+- Multi-column kwargs: `on=["a", "b"]`, `over(["a", "b"])`, `sort(["a", "b"])`
+- String escapes: `\n`, `\t`, `\r`, `\\`, `\"`, `\'`
 - `pl.col("a", "b")` multi-column select

@@ -31,9 +31,10 @@ fn transform_expr(expr: SurfaceExpr) -> CoreExpr {
             // Check for .otherwise() pattern - signals end of when chain
             if let SurfaceExpr::Attr(ref base, ref method) = *callee
                 && method == "otherwise"
-                    && let Some(when_chain) = try_extract_when_chain(base) {
-                        return build_when_then_otherwise(when_chain, args);
-                    }
+                && let Some(when_chain) = try_extract_when_chain(base)
+            {
+                return build_when_then_otherwise(when_chain, args);
+            }
             // Normal call
             CoreExpr::Call(
                 Box::new(transform_expr(*callee)),
@@ -65,47 +66,50 @@ fn try_extract_when_chain(expr: &SurfaceExpr) -> Option<Vec<WhenThenPair>> {
     loop {
         // Expect: Call(Attr(inner, "then"), [then_value])
         if let SurfaceExpr::Call(then_callee, then_args) = current
-            && let SurfaceExpr::Attr(when_expr, method) = then_callee.as_ref() {
-                if method != "then" {
+            && let SurfaceExpr::Attr(when_expr, method) = then_callee.as_ref()
+        {
+            if method != "then" {
+                return None;
+            }
+            let then_value = get_single_positional_arg(then_args)?;
+
+            // Now check what's before .then()
+            // It should be Call(Attr(_, "when"), [condition])
+            if let SurfaceExpr::Call(when_callee, when_args) = when_expr.as_ref()
+                && let SurfaceExpr::Attr(inner, when_method) = when_callee.as_ref()
+            {
+                if when_method != "when" {
                     return None;
                 }
-                let then_value = get_single_positional_arg(then_args)?;
+                let condition = get_single_positional_arg(when_args)?;
 
-                // Now check what's before .then()
-                // It should be Call(Attr(_, "when"), [condition])
-                if let SurfaceExpr::Call(when_callee, when_args) = when_expr.as_ref()
-                    && let SurfaceExpr::Attr(inner, when_method) = when_callee.as_ref() {
-                        if when_method != "when" {
-                            return None;
-                        }
-                        let condition = get_single_positional_arg(when_args)?;
+                pairs.push(WhenThenPair {
+                    condition: condition.clone(),
+                    then_value: then_value.clone(),
+                });
 
-                        pairs.push(WhenThenPair {
-                            condition: condition.clone(),
-                            then_value: then_value.clone(),
-                        });
-
-                        // Check if inner is pl.when (root) or another then (chained)
-                        if is_pl_ident(inner) {
-                            // We've reached the root: pl.when(...)
-                            pairs.reverse();
-                            return Some(pairs);
-                        } else {
-                            // Continue up the chain
-                            current = inner;
-                            continue;
-                        }
-                    }
+                // Check if inner is pl.when (root) or another then (chained)
+                if is_pl_ident(inner) {
+                    // We've reached the root: pl.when(...)
+                    pairs.reverse();
+                    return Some(pairs);
+                } else {
+                    // Continue up the chain
+                    current = inner;
+                    continue;
+                }
             }
+        }
         return None;
     }
 }
 
 fn get_single_positional_arg(args: &[SurfaceArg]) -> Option<&SurfaceExpr> {
     if args.len() == 1
-        && let Arg::Positional(e) = &args[0] {
-            return Some(e);
-        }
+        && let Arg::Positional(e) = &args[0]
+    {
+        return Some(e);
+    }
     None
 }
 

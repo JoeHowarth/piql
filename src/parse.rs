@@ -255,11 +255,52 @@ fn float_lit(input: &mut &str) -> PResult<Literal> {
 
 fn string_lit(input: &mut &str) -> PResult<Literal> {
     alt((
-        delimited('"', take_while(0.., |c| c != '"'), '"'),
-        delimited('\'', take_while(0.., |c| c != '\''), '\''),
+        delimited('"', string_contents('"'), '"'),
+        delimited('\'', string_contents('\''), '\''),
     ))
-    .map(|s: &str| Literal::String(s.to_string()))
+    .map(Literal::String)
     .parse_next(input)
+}
+
+fn string_contents<'a>(quote: char) -> impl FnMut(&mut &'a str) -> PResult<String> {
+    move |input: &mut &'a str| {
+        let mut result = String::new();
+        loop {
+            if input.is_empty() {
+                return Err(winnow::error::ErrMode::Backtrack(
+                    winnow::error::ContextError::new(),
+                ));
+            }
+            let c = input.chars().next().unwrap();
+            if c == quote {
+                break;
+            } else if c == '\\' {
+                *input = &input[1..];
+                if input.is_empty() {
+                    return Err(winnow::error::ErrMode::Backtrack(
+                        winnow::error::ContextError::new(),
+                    ));
+                }
+                let escaped = input.chars().next().unwrap();
+                let unescaped = match escaped {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '\\' => '\\',
+                    '"' => '"',
+                    '\'' => '\'',
+                    '0' => '\0',
+                    _ => escaped, // Unknown escapes pass through
+                };
+                result.push(unescaped);
+                *input = &input[1..];
+            } else {
+                result.push(c);
+                *input = &input[c.len_utf8()..];
+            }
+        }
+        Ok(result)
+    }
 }
 
 // ============ Whitespace ============

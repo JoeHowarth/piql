@@ -51,3 +51,13 @@ Future: add sugar variants to surface::Expr, expand in transform().
 - Multi-column kwargs: `on=["a", "b"]`, `over(["a", "b"])`, `sort(["a", "b"])`
 - String escapes: `\n`, `\t`, `\r`, `\\`, `\"`, `\'`
 - `pl.col("a", "b")` multi-column select
+
+## Deferred Features
+
+**pivot / unpivot** - Reshape long ↔ wide format. Useful for:
+- Event logs → per-entity event columns
+- Resource history → tick-by-tick comparison columns
+- EAV attribute tables → wide entity tables for filtering
+- Wide resource columns → long format for aggregation
+
+Not implemented yet. Add when needed for game/simulation use cases.

@@ -1,0 +1,20 @@
+[package]
+name = "piql"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+polars = { version = "0.46", features = [
+    "lazy",
+    "strings",
+    "temporal",
+    "dtype-date",
+    "dtype-datetime",
+    "rolling_window",
+    "rank",
+    "is_between",
+    "diff",
+] }
+thiserror = "2"
+log = "0.4"
+winnow = "0.7"

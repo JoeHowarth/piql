@@ -41,6 +41,26 @@ entities.with_columns(
 )
 ```
 
+## Supported Features
+
+**DataFrame methods**
+`filter`, `select`, `with_columns`, `head`, `tail`, `sort`, `drop`, `explode`, `group_by`, `join`, `rename`, `drop_nulls`, `reverse`
+
+**Expr methods**
+`alias`, `over`, `is_between`, `diff`, `shift`, `sum`, `mean`, `min`, `max`, `count`, `first`, `last`, `cast`, `fill_null`, `is_null`, `is_not_null`, `unique`, `abs`, `round`, `len`, `n_unique`, `cum_sum`, `cum_max`, `cum_min`, `rank`, `clip`, `reverse`
+
+**pl functions**
+`col`, `lit`, `when`/`then`/`otherwise`
+
+**str namespace**
+`starts_with`, `ends_with`, `to_lowercase`, `to_uppercase`, `len_chars`, `contains`, `replace`, `slice`
+
+**dt namespace**
+`year`, `month`, `day`, `hour`, `minute`, `second`
+
+**Operators**
+`+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&`, `|`, `~`
+
 ## Usage
 
 ```rust

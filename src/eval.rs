@@ -273,6 +273,8 @@ fn eval_df_method(
             let col_exprs: Vec<_> = col_names.iter().map(col).collect();
             Ok(Value::DataFrame(df.explode(col_exprs)))
         }
+        "drop_nulls" => Ok(Value::DataFrame(df.drop_nulls(None))),
+        "reverse" => Ok(Value::DataFrame(df.reverse())),
         "group_by" => {
             let col_names = collect_string_args(args)?;
             let col_exprs: Vec<_> = col_names.iter().map(col).collect();
@@ -429,6 +431,23 @@ fn eval_expr_method(
         "is_null" => Ok(Value::Expr(e.is_null())),
         "is_not_null" => Ok(Value::Expr(e.is_not_null())),
         "unique" => Ok(Value::Expr(e.unique())),
+        "abs" => Ok(Value::Expr(e.abs())),
+        "round" => {
+            let decimals = get_int_arg(args, 0, "round")? as u32;
+            Ok(Value::Expr(e.round(decimals)))
+        }
+        "len" => Ok(Value::Expr(e.len())),
+        "n_unique" => Ok(Value::Expr(e.n_unique())),
+        "cum_sum" => Ok(Value::Expr(e.cum_sum(false))),
+        "cum_max" => Ok(Value::Expr(e.cum_max(false))),
+        "cum_min" => Ok(Value::Expr(e.cum_min(false))),
+        "rank" => Ok(Value::Expr(e.rank(Default::default(), None))),
+        "clip" => {
+            let min_val = eval_to_expr(get_positional_arg(args, 0, "clip")?, ctx)?;
+            let max_val = eval_to_expr(get_positional_arg(args, 1, "clip")?, ctx)?;
+            Ok(Value::Expr(e.clip(min_val, max_val)))
+        }
+        "reverse" => Ok(Value::Expr(e.reverse())),
         _ => Err(EvalError::UnknownMethod {
             target: "Expr".to_string(),
             method: method.to_string(),
@@ -450,6 +469,24 @@ fn eval_str_method(e: polars::prelude::Expr, method: &str, args: &[CoreArg]) -> 
         "to_lowercase" => Ok(Value::Expr(str_ns.to_lowercase())),
         "to_uppercase" => Ok(Value::Expr(str_ns.to_uppercase())),
         "len_chars" => Ok(Value::Expr(str_ns.len_chars())),
+        "contains" => {
+            let pattern = get_string_arg(args, 0, "contains")?;
+            Ok(Value::Expr(str_ns.contains(lit(pattern), false)))
+        }
+        "replace" => {
+            let pattern = get_string_arg(args, 0, "replace")?;
+            let replacement = get_string_arg(args, 1, "replace")?;
+            Ok(Value::Expr(str_ns.replace(
+                lit(pattern),
+                lit(replacement),
+                false,
+            )))
+        }
+        "slice" => {
+            let offset = get_int_arg(args, 0, "slice")?;
+            let length = get_int_arg(args, 1, "slice")? as u64;
+            Ok(Value::Expr(str_ns.slice(lit(offset), lit(length))))
+        }
         _ => Err(EvalError::UnknownMethod {
             target: "str".to_string(),
             method: method.to_string(),
@@ -691,25 +728,26 @@ fn get_kwarg_string(args: &[CoreArg], name: &str) -> Option<String> {
 fn get_kwarg_strings(args: &[CoreArg], name: &str) -> Option<Vec<String>> {
     for arg in args {
         if let Arg::Keyword(k, v) = arg
-            && k == name {
-                match v {
-                    Expr::Literal(Literal::String(s)) => return Some(vec![s.clone()]),
-                    Expr::List(items) => {
-                        let strings: Option<Vec<_>> = items
-                            .iter()
-                            .map(|e| {
-                                if let Expr::Literal(Literal::String(s)) = e {
-                                    Some(s.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        return strings;
-                    }
-                    _ => return None,
+            && k == name
+        {
+            match v {
+                Expr::Literal(Literal::String(s)) => return Some(vec![s.clone()]),
+                Expr::List(items) => {
+                    let strings: Option<Vec<_>> = items
+                        .iter()
+                        .map(|e| {
+                            if let Expr::Literal(Literal::String(s)) = e {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    return strings;
                 }
+                _ => return None,
             }
+        }
     }
     None
 }

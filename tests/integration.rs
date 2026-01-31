@@ -753,3 +753,283 @@ fn string_with_escaped_quote() {
     let greeting = result.column("greeting").unwrap().str().unwrap();
     assert_eq!(greeting.get(0).unwrap(), "say \"hello\"");
 }
+
+// ============ Math expr methods ============
+
+#[test]
+fn expr_abs() {
+    let df = df! {
+        "val" => &[-5, 0, 5, -10],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("val").abs().alias("abs_val"))"#,
+        &ctx,
+    );
+    let abs_val = result.column("abs_val").unwrap().i32().unwrap();
+    assert_eq!(abs_val.get(0).unwrap(), 5);
+    assert_eq!(abs_val.get(3).unwrap(), 10);
+}
+
+#[test]
+fn expr_round() {
+    let df = df! {
+        "val" => &[1.234, 5.678, 9.999],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("val").round(1).alias("rounded"))"#,
+        &ctx,
+    );
+    let rounded = result.column("rounded").unwrap().f64().unwrap();
+    assert!((rounded.get(0).unwrap() - 1.2).abs() < 0.01);
+    assert!((rounded.get(1).unwrap() - 5.7).abs() < 0.01);
+}
+
+#[test]
+fn expr_len() {
+    let ctx = setup_test_df();
+    let result = run_to_df(
+        r#"entities.select(pl.col("name").len().alias("count"))"#,
+        &ctx,
+    );
+    assert_eq!(
+        result
+            .column("count")
+            .unwrap()
+            .u32()
+            .unwrap()
+            .get(0)
+            .unwrap(),
+        3
+    );
+}
+
+#[test]
+fn expr_n_unique() {
+    let ctx = setup_test_df();
+    let result = run_to_df(
+        r#"entities.select(pl.col("type").n_unique().alias("unique_types"))"#,
+        &ctx,
+    );
+    assert_eq!(
+        result
+            .column("unique_types")
+            .unwrap()
+            .u32()
+            .unwrap()
+            .get(0)
+            .unwrap(),
+        2
+    );
+}
+
+// ============ String methods ============
+
+#[test]
+fn str_contains() {
+    let ctx = setup_test_df();
+    let result = run_to_df(
+        r#"entities.filter(pl.col("name").str.contains("li"))"#,
+        &ctx,
+    );
+    assert_eq!(result.height(), 2); // alice and charlie
+}
+
+#[test]
+fn str_replace() {
+    let df = df! {
+        "text" => &["hello world", "foo bar"],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("text").str.replace("o", "0").alias("replaced"))"#,
+        &ctx,
+    );
+    let replaced = result.column("replaced").unwrap().str().unwrap();
+    assert_eq!(replaced.get(0).unwrap(), "hell0 world");
+}
+
+#[test]
+fn str_slice() {
+    let df = df! {
+        "text" => &["hello", "world"],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("text").str.slice(0, 3).alias("sliced"))"#,
+        &ctx,
+    );
+    let sliced = result.column("sliced").unwrap().str().unwrap();
+    assert_eq!(sliced.get(0).unwrap(), "hel");
+    assert_eq!(sliced.get(1).unwrap(), "wor");
+}
+
+// ============ DataFrame methods ============
+
+#[test]
+fn drop_nulls_df() {
+    let df = df! {
+        "a" => &[Some(1), None, Some(3)],
+        "b" => &[Some("x"), Some("y"), None],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(r#"df.drop_nulls()"#, &ctx);
+    assert_eq!(result.height(), 1); // only row 0 has no nulls... wait, row 0 has all values
+}
+
+// ============ Cumulative functions ============
+
+#[test]
+fn expr_cum_sum() {
+    let df = df! {
+        "val" => &[1, 2, 3, 4],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("val").cum_sum().alias("running_total"))"#,
+        &ctx,
+    );
+    let running = result.column("running_total").unwrap().i32().unwrap();
+    assert_eq!(running.get(0).unwrap(), 1);
+    assert_eq!(running.get(1).unwrap(), 3);
+    assert_eq!(running.get(2).unwrap(), 6);
+    assert_eq!(running.get(3).unwrap(), 10);
+}
+
+#[test]
+fn expr_cum_max() {
+    let df = df! {
+        "val" => &[1, 3, 2, 5, 4],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("val").cum_max().alias("running_max"))"#,
+        &ctx,
+    );
+    let running = result.column("running_max").unwrap().i32().unwrap();
+    assert_eq!(running.get(0).unwrap(), 1);
+    assert_eq!(running.get(1).unwrap(), 3);
+    assert_eq!(running.get(2).unwrap(), 3);
+    assert_eq!(running.get(3).unwrap(), 5);
+}
+
+#[test]
+fn expr_cum_min() {
+    let df = df! {
+        "val" => &[5, 3, 4, 1, 2],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("val").cum_min().alias("running_min"))"#,
+        &ctx,
+    );
+    let running = result.column("running_min").unwrap().i32().unwrap();
+    assert_eq!(running.get(0).unwrap(), 5);
+    assert_eq!(running.get(1).unwrap(), 3);
+    assert_eq!(running.get(2).unwrap(), 3);
+    assert_eq!(running.get(3).unwrap(), 1);
+}
+
+// ============ Rank, clip, reverse ============
+
+#[test]
+fn expr_rank() {
+    let df = df! {
+        "val" => &[10, 30, 20, 40],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("val").rank().alias("ranked"))"#,
+        &ctx,
+    );
+    let ranked = result.column("ranked").unwrap().u32().unwrap();
+    assert_eq!(ranked.get(0).unwrap(), 1); // 10 is rank 1
+    assert_eq!(ranked.get(1).unwrap(), 3); // 30 is rank 3
+    assert_eq!(ranked.get(2).unwrap(), 2); // 20 is rank 2
+    assert_eq!(ranked.get(3).unwrap(), 4); // 40 is rank 4
+}
+
+#[test]
+fn expr_clip() {
+    let df = df! {
+        "val" => &[1, 5, 10, 15, 20],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("val").clip(5, 15).alias("clipped"))"#,
+        &ctx,
+    );
+    let clipped = result.column("clipped").unwrap().i32().unwrap();
+    assert_eq!(clipped.get(0).unwrap(), 5); // 1 clipped to 5
+    assert_eq!(clipped.get(1).unwrap(), 5); // 5 stays
+    assert_eq!(clipped.get(2).unwrap(), 10); // 10 stays
+    assert_eq!(clipped.get(3).unwrap(), 15); // 15 stays
+    assert_eq!(clipped.get(4).unwrap(), 15); // 20 clipped to 15
+}
+
+#[test]
+fn expr_reverse() {
+    let df = df! {
+        "val" => &[1, 2, 3, 4],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.with_columns(pl.col("val").reverse().alias("reversed"))"#,
+        &ctx,
+    );
+    let reversed = result.column("reversed").unwrap().i32().unwrap();
+    assert_eq!(reversed.get(0).unwrap(), 4);
+    assert_eq!(reversed.get(1).unwrap(), 3);
+    assert_eq!(reversed.get(2).unwrap(), 2);
+    assert_eq!(reversed.get(3).unwrap(), 1);
+}
+
+#[test]
+fn df_reverse() {
+    let df = df! {
+        "val" => &[1, 2, 3],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(r#"df.reverse()"#, &ctx);
+    let val = result.column("val").unwrap().i32().unwrap();
+    assert_eq!(val.get(0).unwrap(), 3);
+    assert_eq!(val.get(1).unwrap(), 2);
+    assert_eq!(val.get(2).unwrap(), 1);
+}

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nAdd high-value Expr and DataFrame methods\n\nExpr methods:\n- abs, round, len, n_unique\n- cum_sum, cum_max, cum_min\n- rank, clip, reverse\n\nString methods:\n- contains, replace, slice\n\nDataFrame methods:\n- drop_nulls, reverse\n\nAdded Polars features: abs, round_series, cum_agg, regex\n\n68 tests passing\nEOF\n)\")"
     ],
     "deny": [],
     "ask": []

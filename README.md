@@ -44,7 +44,7 @@ entities.with_columns(
 ## Supported Features
 
 **DataFrame methods**
-`filter`, `select`, `with_columns`, `head`, `tail`, `sort`, `drop`, `explode`, `group_by`, `join`, `rename`, `drop_nulls`, `reverse`
+`filter`, `select`, `with_columns`, `head`, `tail`, `sort`, `drop`, `explode`, `group_by`, `join`, `rename`, `drop_nulls`, `reverse`, `all`, `window`, `since`, `at`, `top`
 
 **Expr methods**
 `alias`, `over`, `is_between`, `diff`, `shift`, `sum`, `mean`, `min`, `max`, `count`, `first`, `last`, `cast`, `fill_null`, `is_null`, `is_not_null`, `unique`, `abs`, `round`, `len`, `n_unique`, `cum_sum`, `cum_max`, `cum_min`, `rank`, `clip`, `reverse`
@@ -61,14 +61,40 @@ entities.with_columns(
 **Operators**
 `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&`, `|`, `~`
 
+**Sugar**
+- `$col` → `pl.col("col")`
+- `$col.delta` → `col.diff().over(partition)`
+- `$col.delta(n)` → `col - col.shift(n).over(partition)`
+- `$col.pct(n)` → percent change over n periods
+- `@directive(args)` → custom filter expressions
+
 ## Usage
 
 ```rust
-use piql::{run, EvalContext};
+use piql::{run, EvalContext, TimeSeriesConfig};
 
+// Basic usage
 let ctx = EvalContext::new()
     .with_df("entities", entities_df)
     .with_df("locations", locations_df);
 
 let result = run(r#"entities.filter(pl.col("gold") > 100)"#, &ctx)?;
+
+// With sugar and time-series support
+let mut ctx = EvalContext::new()
+    .with_time_series_df("entities", df, TimeSeriesConfig {
+        tick_column: "tick".into(),
+        partition_key: "entity_id".into(),
+    })
+    .with_tick(1000);
+
+// Register custom directives
+ctx.sugar.register_directive("merchant", |_, _| {
+    // Returns: pl.col("type") == "merchant"
+    // ...
+});
+
+// Use sugar syntax
+let result = run(r#"entities.filter($gold > 100)"#, &ctx)?;
+let result = run(r#"entities.window(-50, 0).filter(@merchant)"#, &ctx)?;
 ```

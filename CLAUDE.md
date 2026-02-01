@@ -7,10 +7,11 @@ src/
 ├── lib.rs          # Public API: run(), re-exports
 ├── parse.rs        # Winnow parser -> surface::Expr
 ├── transform.rs    # surface::Expr -> core::Expr (desugaring)
+├── sugar.rs        # SugarRegistry, SugarContext, directive handlers
 ├── eval.rs         # core::Expr interpreter against Polars
 └── ast/
     ├── mod.rs      # Shared types: Literal, BinOp, UnaryOp, Arg<E>
-    ├── surface.rs  # Parser output AST
+    ├── surface.rs  # Parser output AST (includes ColShorthand, Directive)
     └── core.rs     # Eval input AST (has WhenThenOtherwise)
 
 tests/
@@ -32,19 +33,32 @@ Prefer black-box integration tests over unit tests. Tests should:
 
 Unit tests only for tricky parser/transform edge cases.
 
-## Desugaring Strategy
+## Sugar System
 
-The surface/core AST split exists for future sugar expansion:
+The surface/core AST split enables sugar expansion in the transform pass.
 
-| Sugar | Expansion |
-|-------|-----------|
-| `$gold` | `pl.col("gold")` |
-| `@now` | `pl.lit(ctx.now)` |
-| `@tick` | `pl.lit(ctx.tick)` |
-| `@entity.location` | context-dependent column access |
+**Implemented:**
 
-Transform pass handles pattern recognition (e.g., when/then/otherwise chains).
-Future: add sugar variants to surface::Expr, expand in transform().
+| Sugar | Expansion | Where |
+|-------|-----------|-------|
+| `$col` | `pl.col("col")` | transform |
+| `$col.delta` | `col.diff().over(partition)` | transform (SugarRegistry) |
+| `$col.delta(n)` | `col - col.shift(n).over(partition)` | transform (SugarRegistry) |
+| `$col.pct(n)` | percent change formula | transform (SugarRegistry) |
+| `@directive(args)` | custom (registered at runtime) | transform (SugarRegistry) |
+| `.window(a, b)` | tick filter | eval |
+| `.since(n)` | tick filter | eval |
+| `.at(n)` | tick filter | eval |
+| `.all()` | no time filter | eval |
+| `.top(n, col)` | sort desc + head | eval |
+
+Transform pass handles:
+- Pattern recognition (when/then/otherwise chains)
+- `$col` and `@directive` expansion via SugarRegistry
+
+Eval pass handles:
+- Scope methods (window, since, at, all)
+- Convenience methods (top)
 
 ## Supported Syntax
 

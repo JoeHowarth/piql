@@ -22,3 +22,4 @@ polars = { version = "0.46", features = [
 thiserror = "2"
 log = "0.4"
 winnow = "0.7"
+indexmap = "2"

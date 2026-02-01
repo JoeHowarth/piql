@@ -31,9 +31,13 @@ pub enum Expr {
 
     /// Unary operation: `-x`, `~x`
     UnaryOp(UnaryOp, Box<Expr>),
-    // === Sugar (to be added) ===
-    // ColShorthand(String),           // $gold
-    // Directive(String, Vec<SurfaceArg>),  // @now, @tick(500)
+
+    // === Sugar ===
+    /// Column shorthand: `$gold` -> `pl.col("gold")`
+    ColShorthand(String),
+
+    /// Directive: `@merchant`, `@entity(42)`
+    Directive(String, Vec<SurfaceArg>),
 }
 
 impl Expr {

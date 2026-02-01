@@ -37,8 +37,8 @@ type Result<T> = std::result::Result<T, EvalError>;
 /// Runtime value produced by evaluation
 #[derive(Clone)]
 pub enum Value {
-    /// A Polars LazyFrame
-    DataFrame(LazyFrame),
+    /// A Polars LazyFrame, with optional source name for base table routing
+    DataFrame(LazyFrame, Option<String>),
     /// A Polars LazyGroupBy (from group_by, before agg)
     GroupBy(LazyGroupBy),
     /// A Polars column expression
@@ -58,21 +58,149 @@ pub enum ScalarValue {
     Null,
 }
 
+/// Configuration for time-series dataframes
+#[derive(Debug, Clone)]
+pub struct TimeSeriesConfig {
+    /// Column name containing tick values
+    pub tick_column: String,
+    /// Partition key for windowed operations (e.g., "entity_id")
+    pub partition_key: String,
+}
+
+/// A registered dataframe with optional time-series config
+#[derive(Clone)]
+pub struct DataFrameEntry {
+    pub df: LazyFrame,
+    pub time_series: Option<TimeSeriesConfig>,
+}
+
+/// State for a base table tracked in eval context
+#[derive(Clone)]
+pub struct BaseTableEntry {
+    /// All historical data (None until first data appended)
+    pub all: Option<LazyFrame>,
+    /// Current tick's data only (None until first data appended)
+    pub now: Option<LazyFrame>,
+    /// Time-series configuration
+    pub config: TimeSeriesConfig,
+}
+
 /// Evaluation context - holds named dataframes and configuration
 pub struct EvalContext {
-    pub dataframes: HashMap<String, LazyFrame>,
+    pub dataframes: HashMap<String, DataFrameEntry>,
+    /// Base tables with all/now ptrs for implicit now scoping
+    pub base_tables: HashMap<String, BaseTableEntry>,
+    /// Current simulation tick (for @now, .window, etc.)
+    pub tick: Option<i64>,
+    /// Sugar registry for directive expansion
+    pub sugar: crate::sugar::SugarRegistry,
 }
 
 impl EvalContext {
     pub fn new() -> Self {
         Self {
             dataframes: HashMap::new(),
+            base_tables: HashMap::new(),
+            tick: None,
+            sugar: crate::sugar::SugarRegistry::new(),
         }
     }
 
+    /// Add a regular (non-time-series) dataframe
     pub fn with_df(mut self, name: impl Into<String>, df: LazyFrame) -> Self {
-        self.dataframes.insert(name.into(), df);
+        self.dataframes.insert(
+            name.into(),
+            DataFrameEntry {
+                df,
+                time_series: None,
+            },
+        );
         self
+    }
+
+    /// Add a time-series dataframe with tick column and partition key
+    pub fn with_time_series_df(
+        mut self,
+        name: impl Into<String>,
+        df: LazyFrame,
+        config: TimeSeriesConfig,
+    ) -> Self {
+        self.dataframes.insert(
+            name.into(),
+            DataFrameEntry {
+                df,
+                time_series: Some(config),
+            },
+        );
+        self
+    }
+
+    /// Set the current tick for time-based queries
+    pub fn with_tick(mut self, tick: i64) -> Self {
+        self.tick = Some(tick);
+        self
+    }
+
+    /// Get time-series config for a dataframe (if registered as time-series)
+    pub fn get_time_series_config(&self, name: &str) -> Option<&TimeSeriesConfig> {
+        self.dataframes
+            .get(name)
+            .and_then(|entry| entry.time_series.as_ref())
+    }
+
+    /// Build a SugarContext from this EvalContext for a specific dataframe
+    pub fn sugar_context(&self, df_name: Option<&str>) -> crate::sugar::SugarContext {
+        let partition_key = df_name
+            .and_then(|name| self.get_time_series_config(name))
+            .map(|ts| ts.partition_key.clone());
+
+        crate::sugar::SugarContext {
+            tick: self.tick,
+            partition_key,
+        }
+    }
+
+    /// Register a base table (called by QueryEngine::register_base)
+    pub fn register_base_table(&mut self, name: String, config: TimeSeriesConfig) {
+        self.base_tables.insert(
+            name,
+            BaseTableEntry {
+                all: None,
+                now: None,
+                config,
+            },
+        );
+    }
+
+    /// Update base table ptrs (called by QueryEngine::append_tick)
+    pub fn update_base_table_ptrs(&mut self, name: &str, all: LazyFrame, now: LazyFrame) {
+        if let Some(entry) = self.base_tables.get_mut(name) {
+            entry.all = Some(all.clone());
+            entry.now = Some(now);
+            // Also update dataframes to point to `all` (for non-base-table-aware code paths)
+            self.dataframes.insert(
+                name.to_string(),
+                DataFrameEntry {
+                    df: all,
+                    time_series: Some(entry.config.clone()),
+                },
+            );
+        }
+    }
+
+    /// Check if a name is a base table
+    pub fn is_base_table(&self, name: &str) -> bool {
+        self.base_tables.contains_key(name)
+    }
+
+    /// Get the `now` ptr for a base table
+    pub fn get_base_now(&self, name: &str) -> Option<LazyFrame> {
+        self.base_tables.get(name).and_then(|e| e.now.clone())
+    }
+
+    /// Get the `all` ptr for a base table
+    pub fn get_base_all(&self, name: &str) -> Option<LazyFrame> {
+        self.base_tables.get(name).and_then(|e| e.all.clone())
     }
 }
 
@@ -102,8 +230,13 @@ fn eval_ident(name: &str, ctx: &EvalContext) -> Result<Value> {
     match name {
         "pl" => Ok(Value::PlNamespace),
         _ => {
-            if let Some(df) = ctx.dataframes.get(name) {
-                Ok(Value::DataFrame(df.clone()))
+            // Check if it's a base table - return `now` ptr for implicit now
+            if let Some(now_df) = ctx.get_base_now(name) {
+                return Ok(Value::DataFrame(now_df, Some(name.to_string())));
+            }
+            // Otherwise check regular dataframes
+            if let Some(entry) = ctx.dataframes.get(name) {
+                Ok(Value::DataFrame(entry.df.clone(), None))
             } else {
                 Err(EvalError::UnknownIdent(name.to_string()))
             }
@@ -146,7 +279,7 @@ fn eval_attr(base: &Expr, attr: &str, ctx: &EvalContext) -> Result<Value> {
                 }),
             }
         }
-        Value::DataFrame(_) => Err(EvalError::UnknownMethod {
+        Value::DataFrame(_, _) => Err(EvalError::UnknownMethod {
             target: "DataFrame".to_string(),
             method: attr.to_string(),
         }),
@@ -193,7 +326,7 @@ fn eval_method_call(
 
     match base_val {
         Value::PlNamespace => eval_pl_function(method, args, ctx),
-        Value::DataFrame(df) => eval_df_method(df, method, args, ctx),
+        Value::DataFrame(df, source) => eval_df_method(df, source, method, args, ctx),
         Value::GroupBy(gb) => eval_groupby_method(gb, method, args, ctx),
         Value::Expr(e) => eval_expr_method(e, method, args, ctx),
         Value::Scalar(_) => Err(EvalError::TypeError {
@@ -232,6 +365,7 @@ fn eval_pl_function(name: &str, args: &[CoreArg], ctx: &EvalContext) -> Result<V
 
 fn eval_df_method(
     df: LazyFrame,
+    source: Option<String>,
     method: &str,
     args: &[CoreArg],
     ctx: &EvalContext,
@@ -240,41 +374,41 @@ fn eval_df_method(
         "filter" => {
             let pred = get_positional_arg(args, 0, "filter")?;
             let pred_expr = eval_to_expr(pred, ctx)?;
-            Ok(Value::DataFrame(df.filter(pred_expr)))
+            Ok(Value::DataFrame(df.filter(pred_expr), source))
         }
         "select" => {
             let exprs = collect_expr_args(args, ctx)?;
-            Ok(Value::DataFrame(df.select(exprs)))
+            Ok(Value::DataFrame(df.select(exprs), None)) // select changes shape, clear source
         }
         "with_columns" => {
             let exprs = collect_expr_args(args, ctx)?;
-            Ok(Value::DataFrame(df.with_columns(exprs)))
+            Ok(Value::DataFrame(df.with_columns(exprs), source))
         }
         "head" => {
             let n = get_int_arg(args, 0, "head").unwrap_or(10) as u32;
-            Ok(Value::DataFrame(df.limit(n)))
+            Ok(Value::DataFrame(df.limit(n), source))
         }
         "sort" => {
             let col_names = get_strings_arg(args, 0, "sort")?;
             let descending = get_kwarg_bool(args, "descending").unwrap_or(false);
             let opts = SortMultipleOptions::new().with_order_descending(descending);
-            Ok(Value::DataFrame(df.sort(&col_names, opts)))
+            Ok(Value::DataFrame(df.sort(&col_names, opts), source))
         }
         "tail" => {
             let n = get_int_arg(args, 0, "tail").unwrap_or(10) as u32;
-            Ok(Value::DataFrame(df.tail(n)))
+            Ok(Value::DataFrame(df.tail(n), source))
         }
         "drop" => {
             let col_names = collect_string_args(args)?;
-            Ok(Value::DataFrame(df.drop(col_names)))
+            Ok(Value::DataFrame(df.drop(col_names), source))
         }
         "explode" => {
             let col_names = collect_string_args(args)?;
             let col_exprs: Vec<_> = col_names.iter().map(col).collect();
-            Ok(Value::DataFrame(df.explode(col_exprs)))
+            Ok(Value::DataFrame(df.explode(col_exprs), source))
         }
-        "drop_nulls" => Ok(Value::DataFrame(df.drop_nulls(None))),
-        "reverse" => Ok(Value::DataFrame(df.reverse())),
+        "drop_nulls" => Ok(Value::DataFrame(df.drop_nulls(None), source)),
+        "reverse" => Ok(Value::DataFrame(df.reverse(), source)),
         "group_by" => {
             let col_names = collect_string_args(args)?;
             let col_exprs: Vec<_> = col_names.iter().map(col).collect();
@@ -295,19 +429,111 @@ fn eval_df_method(
 
             if !renames.is_empty() {
                 let (old_names, new_names): (Vec<_>, Vec<_>) = renames.into_iter().unzip();
-                Ok(Value::DataFrame(df.rename(old_names, new_names, false)))
+                Ok(Value::DataFrame(
+                    df.rename(old_names, new_names, false),
+                    source,
+                ))
             } else {
                 // Positional fallback: rename("old", "new")
                 let old = get_string_arg(args, 0, "rename")?;
                 let new = get_string_arg(args, 1, "rename")?;
-                Ok(Value::DataFrame(df.rename([old], [new], false)))
+                Ok(Value::DataFrame(df.rename([old], [new], false), source))
             }
+        }
+        // Scope methods for time-series data
+        "all" => {
+            // For base tables, swap to `all` ptr; for others, return as-is
+            if let Some(ref name) = source
+                && let Some(all_df) = ctx.get_base_all(name) {
+                    return Ok(Value::DataFrame(all_df, None)); // scope resolved, clear source
+                }
+            Ok(Value::DataFrame(df, None))
+        }
+        "window" => {
+            // For base tables, swap to `all` ptr then filter
+            let a = get_int_arg(args, 0, "window")?;
+            let b = get_int_arg(args, 1, "window")?;
+            let tick = ctx
+                .tick
+                .ok_or_else(|| EvalError::Other(".window() requires tick in context".into()))?;
+
+            // Get the right df and tick column
+            let (target_df, tick_col) = if let Some(ref name) = source {
+                if let Some(entry) = ctx.base_tables.get(name) {
+                    if let Some(ref all_df) = entry.all {
+                        (all_df.clone(), entry.config.tick_column.as_str())
+                    } else {
+                        (df, "tick")
+                    }
+                } else {
+                    (df, "tick")
+                }
+            } else {
+                (df, "tick")
+            };
+
+            let filtered = target_df.filter(col(tick_col).is_between(
+                lit(tick + a),
+                lit(tick + b),
+                ClosedInterval::Both,
+            ));
+            Ok(Value::DataFrame(filtered, None)) // scope resolved
+        }
+        "since" => {
+            // For base tables, swap to `all` ptr then filter
+            let n = get_int_arg(args, 0, "since")?;
+
+            let (target_df, tick_col) = if let Some(ref name) = source {
+                if let Some(entry) = ctx.base_tables.get(name) {
+                    if let Some(ref all_df) = entry.all {
+                        (all_df.clone(), entry.config.tick_column.as_str())
+                    } else {
+                        (df, "tick")
+                    }
+                } else {
+                    (df, "tick")
+                }
+            } else {
+                (df, "tick")
+            };
+
+            let filtered = target_df.filter(col(tick_col).gt_eq(lit(n)));
+            Ok(Value::DataFrame(filtered, None))
+        }
+        "at" => {
+            // For base tables, swap to `all` ptr then filter
+            let n = get_int_arg(args, 0, "at")?;
+
+            let (target_df, tick_col) = if let Some(ref name) = source {
+                if let Some(entry) = ctx.base_tables.get(name) {
+                    if let Some(ref all_df) = entry.all {
+                        (all_df.clone(), entry.config.tick_column.as_str())
+                    } else {
+                        (df, "tick")
+                    }
+                } else {
+                    (df, "tick")
+                }
+            } else {
+                (df, "tick")
+            };
+
+            let filtered = target_df.filter(col(tick_col).eq(lit(n)));
+            Ok(Value::DataFrame(filtered, None))
+        }
+        // Convenience method
+        "top" => {
+            // .top(n, col) -> .sort(col, descending=True).head(n)
+            let n = get_int_arg(args, 0, "top")? as u32;
+            let sort_col = get_string_arg(args, 1, "top")?;
+            let opts = SortMultipleOptions::new().with_order_descending(true);
+            Ok(Value::DataFrame(df.sort([sort_col], opts).limit(n), source))
         }
         "join" => {
             // Get the other dataframe (first positional arg)
             let other_expr = get_positional_arg(args, 0, "join")?;
             let other = match eval(other_expr, ctx)? {
-                Value::DataFrame(lf) => lf,
+                Value::DataFrame(lf, _) => lf,
                 _ => {
                     return Err(EvalError::ArgError(
                         "join() first argument must be a DataFrame".to_string(),
@@ -348,7 +574,7 @@ fn eval_df_method(
                 df.join(other, left_exprs, right_exprs, JoinArgs::new(join_type))
             };
 
-            Ok(Value::DataFrame(result))
+            Ok(Value::DataFrame(result, None)) // join clears source
         }
         _ => Err(EvalError::UnknownMethod {
             target: "DataFrame".to_string(),
@@ -366,7 +592,7 @@ fn eval_groupby_method(
     match method {
         "agg" => {
             let exprs = collect_expr_args(args, ctx)?;
-            Ok(Value::DataFrame(gb.agg(exprs)))
+            Ok(Value::DataFrame(gb.agg(exprs), None)) // agg produces new shape
         }
         _ => Err(EvalError::UnknownMethod {
             target: "GroupBy".to_string(),
@@ -592,7 +818,7 @@ fn eval_to_expr(expr: &Expr, ctx: &EvalContext) -> Result<polars::prelude::Expr>
     match eval(expr, ctx)? {
         Value::Expr(e) => Ok(e),
         Value::Scalar(s) => Ok(scalar_to_lit(s)),
-        Value::DataFrame(_) => Err(EvalError::TypeError {
+        Value::DataFrame(_, _) => Err(EvalError::TypeError {
             expected: "Expr".to_string(),
             got: "DataFrame".to_string(),
         }),
@@ -691,12 +917,21 @@ fn get_strings_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<Vec<St
 
 fn get_int_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<i64> {
     let expr = get_positional_arg(args, idx, fn_name)?;
-    if let Expr::Literal(Literal::Int(n)) = expr {
-        Ok(*n)
-    } else {
-        Err(EvalError::ArgError(format!(
+    match expr {
+        Expr::Literal(Literal::Int(n)) => Ok(*n),
+        // Handle negative integers: -3 parses as UnaryOp(Neg, Int(3))
+        Expr::UnaryOp(crate::ast::UnaryOp::Neg, inner) => {
+            if let Expr::Literal(Literal::Int(n)) = inner.as_ref() {
+                Ok(-n)
+            } else {
+                Err(EvalError::ArgError(format!(
+                    "{fn_name}() argument {idx} must be an integer"
+                )))
+            }
+        }
+        _ => Err(EvalError::ArgError(format!(
             "{fn_name}() argument {idx} must be an integer"
-        )))
+        ))),
     }
 }
 
@@ -781,7 +1016,7 @@ mod tests {
 
         // Known df returns DataFrame
         let result = eval(&Expr::Ident("test".to_string()), &ctx).unwrap();
-        assert!(matches!(result, Value::DataFrame(_)));
+        assert!(matches!(result, Value::DataFrame(_, _)));
 
         // "pl" returns namespace
         let result = eval(&Expr::Ident("pl".to_string()), &ctx).unwrap();

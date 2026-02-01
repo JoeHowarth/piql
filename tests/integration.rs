@@ -2,7 +2,8 @@
 //!
 //! These tests exercise the full parse → eval pipeline.
 
-use piql::{EvalContext, Value, run};
+use piql::expr_helpers::{binop, lit_int, lit_str, pl_col};
+use piql::{BinOp, EvalContext, QueryEngine, TimeSeriesConfig, Value, run};
 use polars::prelude::*;
 
 fn setup_test_df() -> EvalContext {
@@ -19,7 +20,7 @@ fn setup_test_df() -> EvalContext {
 
 fn run_to_df(query: &str, ctx: &EvalContext) -> DataFrame {
     match run(query, ctx).unwrap() {
-        Value::DataFrame(lf) => lf.collect().unwrap(),
+        Value::DataFrame(lf, _) => lf.collect().unwrap(),
         other => panic!(
             "Expected DataFrame, got {:?}",
             std::mem::discriminant(&other)
@@ -1032,4 +1033,484 @@ fn df_reverse() {
     assert_eq!(val.get(0).unwrap(), 3);
     assert_eq!(val.get(1).unwrap(), 2);
     assert_eq!(val.get(2).unwrap(), 1);
+}
+
+// ============ Sugar: $col ============
+
+#[test]
+fn sugar_col_shorthand() {
+    let ctx = setup_test_df();
+    // $gold should expand to pl.col("gold")
+    let df = run_to_df(r#"entities.filter($gold > 100)"#, &ctx);
+    assert_eq!(df.height(), 1);
+    assert_eq!(
+        df.column("name").unwrap().str().unwrap().get(0).unwrap(),
+        "bob"
+    );
+}
+
+#[test]
+fn sugar_col_shorthand_in_select() {
+    let ctx = setup_test_df();
+    let df = run_to_df(r#"entities.select($name, $gold)"#, &ctx);
+    assert_eq!(df.width(), 2);
+    assert!(df.column("name").is_ok());
+    assert!(df.column("gold").is_ok());
+}
+
+#[test]
+fn sugar_col_shorthand_with_method() {
+    let ctx = setup_test_df();
+    // $gold.sum() should work
+    let df = run_to_df(r#"entities.select($gold.sum().alias("total"))"#, &ctx);
+    assert_eq!(
+        df.column("total").unwrap().i32().unwrap().get(0).unwrap(),
+        400
+    );
+}
+
+#[test]
+fn sugar_col_delta() {
+    // $col.delta -> col.diff().over(partition)
+    let df = df! {
+        "entity_id" => &[1, 1, 1, 2, 2],
+        "tick" => &[1, 2, 3, 1, 2],
+        "gold" => &[100, 150, 120, 200, 250],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("entities", df);
+    let result = run_to_df(
+        r#"entities.with_columns($gold.delta.alias("gold_change"))"#,
+        &ctx,
+    );
+
+    let changes = result.column("gold_change").unwrap().i32().unwrap();
+    // First row of each entity should be null (no previous)
+    assert!(changes.get(0).is_none());
+    assert_eq!(changes.get(1).unwrap(), 50); // 150 - 100
+    assert_eq!(changes.get(2).unwrap(), -30); // 120 - 150
+    assert!(changes.get(3).is_none()); // first of entity 2
+    assert_eq!(changes.get(4).unwrap(), 50); // 250 - 200
+}
+
+// ============ Scope Methods ============
+
+#[test]
+fn scope_window() {
+    let df = df! {
+        "tick" => &[95, 96, 97, 98, 99, 100, 101, 102],
+        "value" => &[1, 2, 3, 4, 5, 6, 7, 8],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("data", df).with_tick(100);
+    // window(-3, 0) should get ticks 97-100
+    let result = run_to_df(r#"data.window(-3, 0)"#, &ctx);
+    assert_eq!(result.height(), 4);
+}
+
+#[test]
+fn scope_since() {
+    let df = df! {
+        "tick" => &[1, 2, 3, 4, 5],
+        "value" => &[10, 20, 30, 40, 50],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("data", df);
+    // since(3) should get ticks >= 3
+    let result = run_to_df(r#"data.since(3)"#, &ctx);
+    assert_eq!(result.height(), 3);
+}
+
+#[test]
+fn scope_at() {
+    let df = df! {
+        "tick" => &[1, 2, 3, 4, 5],
+        "value" => &[10, 20, 30, 40, 50],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("data", df);
+    // at(3) should get only tick == 3
+    let result = run_to_df(r#"data.at(3)"#, &ctx);
+    assert_eq!(result.height(), 1);
+    assert_eq!(
+        result
+            .column("value")
+            .unwrap()
+            .i32()
+            .unwrap()
+            .get(0)
+            .unwrap(),
+        30
+    );
+}
+
+#[test]
+fn scope_all() {
+    let df = df! {
+        "tick" => &[1, 2, 3, 4, 5],
+        "value" => &[10, 20, 30, 40, 50],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("data", df);
+    // all() should return all rows
+    let result = run_to_df(r#"data.all()"#, &ctx);
+    assert_eq!(result.height(), 5);
+}
+
+#[test]
+fn scope_top() {
+    let ctx = setup_test_df();
+    // top(2, "gold") should get top 2 by gold descending
+    let result = run_to_df(r#"entities.top(2, "gold")"#, &ctx);
+    assert_eq!(result.height(), 2);
+    let gold = result.column("gold").unwrap().i32().unwrap();
+    assert_eq!(gold.get(0).unwrap(), 250); // bob
+    assert_eq!(gold.get(1).unwrap(), 100); // alice
+}
+
+// ============ Custom Directives ============
+
+#[test]
+fn custom_directive_merchant() {
+    let mut ctx = setup_test_df();
+
+    // Register @merchant directive
+    ctx.sugar.register_directive("merchant", |_, _| {
+        // pl.col("type") == "merchant"
+        binop(pl_col("type"), BinOp::Eq, lit_str("merchant"))
+    });
+
+    let result = run_to_df(r#"entities.filter(@merchant)"#, &ctx);
+    assert_eq!(result.height(), 2); // alice and charlie are merchants
+}
+
+#[test]
+fn custom_directive_entity_with_arg() {
+    let df = df! {
+        "entity_id" => &[1, 2, 3, 4],
+        "name" => &["a", "b", "c", "d"],
+    }
+    .unwrap()
+    .lazy();
+
+    let mut ctx = EvalContext::new().with_df("entities", df);
+
+    // Register @entity(id) directive
+    ctx.sugar.register_directive("entity", |args, _| {
+        // pl.col("entity_id") == id
+        let id = piql::expr_helpers::get_int_arg(args, 0).unwrap_or(0);
+        binop(pl_col("entity_id"), BinOp::Eq, lit_int(id))
+    });
+
+    let result = run_to_df(r#"entities.filter(@entity(2))"#, &ctx);
+    assert_eq!(result.height(), 1);
+    assert_eq!(
+        result
+            .column("name")
+            .unwrap()
+            .str()
+            .unwrap()
+            .get(0)
+            .unwrap(),
+        "b"
+    );
+}
+
+#[test]
+fn time_series_df_with_config() {
+    let df = df! {
+        "entity_id" => &[1, 1, 1, 2, 2, 2],
+        "tick" => &[1, 2, 3, 1, 2, 3],
+        "gold" => &[100, 150, 200, 50, 75, 100],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new()
+        .with_time_series_df(
+            "entities",
+            df,
+            TimeSeriesConfig {
+                tick_column: "tick".into(),
+                partition_key: "entity_id".into(),
+            },
+        )
+        .with_tick(2);
+
+    // Use window to filter and delta which uses partition_key from config
+    let result = run_to_df(
+        r#"entities.window(-1, 0).with_columns($gold.delta.alias("change"))"#,
+        &ctx,
+    );
+    // Should have ticks 1 and 2 for both entities
+    assert_eq!(result.height(), 4);
+}
+
+// ============ QueryEngine ============
+
+#[test]
+fn query_engine_basic() {
+    let df = df! {
+        "name" => &["alice", "bob", "charlie"],
+        "gold" => &[100, 250, 50],
+        "type" => &["merchant", "producer", "merchant"],
+    }
+    .unwrap()
+    .lazy();
+
+    let mut engine = QueryEngine::new();
+    engine.add_base_df("entities", df);
+
+    // One-off query
+    let result = engine.query(r#"entities.filter($gold > 100)"#).unwrap();
+    if let Value::DataFrame(lf, _) = result {
+        assert_eq!(lf.collect().unwrap().height(), 1);
+    } else {
+        panic!("Expected DataFrame");
+    }
+}
+
+#[test]
+fn query_engine_materialized() {
+    let df = df! {
+        "name" => &["alice", "bob", "charlie", "dave"],
+        "gold" => &[100, 250, 50, 300],
+        "type" => &["merchant", "producer", "merchant", "merchant"],
+    }
+    .unwrap()
+    .lazy();
+
+    let mut engine = QueryEngine::new();
+    engine.add_base_df("entities", df);
+
+    // Register @merchant directive
+    engine.sugar().register_directive("merchant", |_, _| {
+        binop(pl_col("type"), BinOp::Eq, lit_str("merchant"))
+    });
+
+    // Materialize intermediate result
+    engine
+        .materialize("merchants", "entities.filter(@merchant)")
+        .unwrap();
+
+    // Query the materialized table
+    let result = engine.query(r#"merchants.filter($gold > 100)"#).unwrap();
+    if let Value::DataFrame(lf, _) = result {
+        let df = lf.collect().unwrap();
+        assert_eq!(df.height(), 1); // only dave (300 gold merchant)
+    } else {
+        panic!("Expected DataFrame");
+    }
+}
+
+#[test]
+fn query_engine_subscriptions() {
+    let df = df! {
+        "tick" => &[1, 1, 2, 2, 3, 3],
+        "entity_id" => &[1, 2, 1, 2, 1, 2],
+        "gold" => &[100, 50, 150, 75, 200, 100],
+    }
+    .unwrap()
+    .lazy();
+
+    let mut engine = QueryEngine::new();
+    engine.add_time_series_df(
+        "entities",
+        df,
+        TimeSeriesConfig {
+            tick_column: "tick".into(),
+            partition_key: "entity_id".into(),
+        },
+    );
+
+    // Subscribe to queries
+    engine.subscribe("rich", r#"entities.at(2).filter($gold > 100)"#);
+    engine.subscribe("all_current", r#"entities.at(2)"#);
+
+    // Process tick 2
+    let results = engine.on_tick(2).unwrap();
+
+    assert_eq!(results.get("rich").unwrap().height(), 1); // entity 1 with 150 gold
+    assert_eq!(results.get("all_current").unwrap().height(), 2); // both entities at tick 2
+}
+
+#[test]
+fn query_engine_materialized_chain() {
+    let df = df! {
+        "tick" => &[1, 1, 1, 2, 2, 2],
+        "entity_id" => &[1, 2, 3, 1, 2, 3],
+        "gold" => &[100, 200, 50, 150, 250, 75],
+        "type" => &["a", "b", "a", "a", "b", "a"],
+    }
+    .unwrap()
+    .lazy();
+
+    let mut engine = QueryEngine::new();
+    engine.add_base_df("entities", df);
+
+    // Chain of materialized tables
+    engine
+        .materialize("type_a", r#"entities.filter($type == "a")"#)
+        .unwrap();
+    engine
+        .materialize("rich_a", r#"type_a.filter($gold > 100)"#)
+        .unwrap();
+
+    // Subscribe to final result
+    engine.subscribe("report", r#"rich_a.at(2)"#);
+
+    let results = engine.on_tick(2).unwrap();
+    let report = results.get("report").unwrap();
+
+    // At tick 2, type_a entities are 1 (150) and 3 (75)
+    // rich_a filters to gold > 100, so only entity 1
+    assert_eq!(report.height(), 1);
+}
+
+// ============ Base Table Routing ============
+
+#[test]
+fn base_table_implicit_now() {
+    // Test that queries on base tables without scope use `now` ptr
+    let mut engine = QueryEngine::new();
+    engine.register_base(
+        "entities",
+        TimeSeriesConfig {
+            tick_column: "tick".into(),
+            partition_key: "entity_id".into(),
+        },
+    );
+
+    // Tick 1: add some entities
+    let tick1 = df! {
+        "tick" => &[1, 1],
+        "entity_id" => &[1, 2],
+        "gold" => &[100, 200],
+    }
+    .unwrap()
+    .lazy();
+    engine.append_tick("entities", tick1).unwrap();
+    engine.set_tick(1);
+
+    // Query without scope - should only see tick 1 data
+    let result = engine.query("entities").unwrap();
+    if let Value::DataFrame(lf, _) = result {
+        assert_eq!(lf.collect().unwrap().height(), 2);
+    } else {
+        panic!("Expected DataFrame");
+    }
+
+    // Tick 2: add more entities
+    let tick2 = df! {
+        "tick" => &[2, 2],
+        "entity_id" => &[1, 2],
+        "gold" => &[150, 250],
+    }
+    .unwrap()
+    .lazy();
+    engine.append_tick("entities", tick2).unwrap();
+    engine.set_tick(2);
+
+    // Query without scope - should only see tick 2 data (implicit now)
+    let result = engine.query("entities").unwrap();
+    if let Value::DataFrame(lf, _) = result {
+        let df = lf.collect().unwrap();
+        assert_eq!(df.height(), 2); // only tick 2 rows
+        let gold: Vec<i32> = df
+            .column("gold")
+            .unwrap()
+            .i32()
+            .unwrap()
+            .into_no_null_iter()
+            .collect();
+        assert_eq!(gold, vec![150, 250]); // tick 2 values
+    } else {
+        panic!("Expected DataFrame");
+    }
+}
+
+#[test]
+fn base_table_all_scope() {
+    // Test that .all() returns full history
+    let mut engine = QueryEngine::new();
+    engine.register_base(
+        "entities",
+        TimeSeriesConfig {
+            tick_column: "tick".into(),
+            partition_key: "entity_id".into(),
+        },
+    );
+
+    // Add data for tick 1 and 2
+    let tick1 = df! {
+        "tick" => &[1, 1],
+        "entity_id" => &[1, 2],
+        "gold" => &[100, 200],
+    }
+    .unwrap()
+    .lazy();
+    engine.append_tick("entities", tick1).unwrap();
+
+    let tick2 = df! {
+        "tick" => &[2, 2],
+        "entity_id" => &[1, 2],
+        "gold" => &[150, 250],
+    }
+    .unwrap()
+    .lazy();
+    engine.append_tick("entities", tick2).unwrap();
+    engine.set_tick(2);
+
+    // .all() should return all 4 rows
+    let result = engine.query("entities.all()").unwrap();
+    if let Value::DataFrame(lf, _) = result {
+        assert_eq!(lf.collect().unwrap().height(), 4);
+    } else {
+        panic!("Expected DataFrame");
+    }
+}
+
+#[test]
+fn base_table_window_scope() {
+    // Test that .window() returns filtered history
+    let mut engine = QueryEngine::new();
+    engine.register_base(
+        "entities",
+        TimeSeriesConfig {
+            tick_column: "tick".into(),
+            partition_key: "entity_id".into(),
+        },
+    );
+
+    // Add data for ticks 1, 2, 3
+    for tick in 1..=3 {
+        let data = df! {
+            "tick" => &[tick, tick],
+            "entity_id" => &[1, 2],
+            "gold" => &[tick * 100, tick * 100 + 50],
+        }
+        .unwrap()
+        .lazy();
+        engine.append_tick("entities", data).unwrap();
+    }
+    engine.set_tick(3);
+
+    // .window(-1, 0) at tick 3 should return ticks 2 and 3
+    let result = engine.query("entities.window(-1, 0)").unwrap();
+    if let Value::DataFrame(lf, _) = result {
+        let df = lf.collect().unwrap();
+        assert_eq!(df.height(), 4); // 2 entities x 2 ticks
+    } else {
+        panic!("Expected DataFrame");
+    }
 }

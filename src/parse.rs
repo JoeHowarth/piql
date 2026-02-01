@@ -183,11 +183,30 @@ fn primary(input: &mut &str) -> PResult<Expr> {
         alt((
             paren_expr,
             list_expr,
+            col_shorthand,
+            directive,
             literal.map(Expr::Literal),
             ident.map(Expr::Ident),
         )),
     )
     .parse_next(input)
+}
+
+/// Parse column shorthand: $gold -> ColShorthand("gold")
+fn col_shorthand(input: &mut &str) -> PResult<Expr> {
+    preceded('$', ident_str)
+        .map(Expr::ColShorthand)
+        .parse_next(input)
+}
+
+/// Parse directive: @merchant, @entity(42)
+fn directive(input: &mut &str) -> PResult<Expr> {
+    (
+        preceded('@', ident_str),
+        opt(delimited(('(', ws), call_args, (ws, ')'))),
+    )
+        .map(|(name, args)| Expr::Directive(name, args.unwrap_or_default()))
+        .parse_next(input)
 }
 
 fn paren_expr(input: &mut &str) -> PResult<Expr> {
@@ -364,6 +383,37 @@ mod tests {
             assert!(matches!(&args[1], SurfaceArg::Keyword(_, _)));
         } else {
             panic!("Expected call");
+        }
+    }
+
+    #[test]
+    fn parse_col_shorthand() {
+        let result = parse("$gold").unwrap();
+        assert!(matches!(result, Expr::ColShorthand(ref s) if s == "gold"));
+
+        // With method chain
+        let result = parse("$gold.sum()").unwrap();
+        assert!(matches!(result, Expr::Call(_, _)));
+    }
+
+    #[test]
+    fn parse_directive() {
+        // No args
+        let result = parse("@merchant").unwrap();
+        if let Expr::Directive(name, args) = result {
+            assert_eq!(name, "merchant");
+            assert!(args.is_empty());
+        } else {
+            panic!("Expected directive");
+        }
+
+        // With args
+        let result = parse("@entity(42)").unwrap();
+        if let Expr::Directive(name, args) = result {
+            assert_eq!(name, "entity");
+            assert_eq!(args.len(), 1);
+        } else {
+            panic!("Expected directive");
         }
     }
 }

@@ -444,9 +444,10 @@ fn eval_df_method(
         "all" => {
             // For base tables, swap to `all` ptr; for others, return as-is
             if let Some(ref name) = source
-                && let Some(all_df) = ctx.get_base_all(name) {
-                    return Ok(Value::DataFrame(all_df, None)); // scope resolved, clear source
-                }
+                && let Some(all_df) = ctx.get_base_all(name)
+            {
+                return Ok(Value::DataFrame(all_df, None)); // scope resolved, clear source
+            }
             Ok(Value::DataFrame(df, None))
         }
         "window" => {

@@ -1,9 +1,11 @@
-[package]
-name = "piql"
-version = "0.1.0"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
 polars = { version = "0.46", features = [
     "lazy",
     "strings",
@@ -18,8 +20,14 @@ polars = { version = "0.46", features = [
     "round_series",
     "cum_agg",
     "regex",
+    "parquet",
+    "csv",
+    "ipc_streaming",
 ] }
 thiserror = "2"
 log = "0.4"
-winnow = "0.7"
-indexmap = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -245,6 +245,11 @@ impl QueryEngine {
     pub fn set_tick(&mut self, tick: i64) {
         self.ctx.tick = Some(tick);
     }
+
+    /// Get names of all registered dataframes
+    pub fn dataframe_names(&self) -> Vec<String> {
+        self.ctx.dataframes.keys().cloned().collect()
+    }
 }
 
 impl Default for QueryEngine {

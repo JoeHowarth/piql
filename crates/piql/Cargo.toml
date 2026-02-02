@@ -1,0 +1,11 @@
+[package]
+name = "piql"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+polars.workspace = true
+thiserror.workspace = true
+log.workspace = true
+winnow = "0.7"
+indexmap = "2"

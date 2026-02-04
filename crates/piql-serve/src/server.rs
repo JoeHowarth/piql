@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::protocol::{ClientMessage, ServerMessage};
+use crate::protocol::{encode_binary_result, ClientMessage, ServerMessage};
 
 #[derive(Error, Debug)]
 pub enum ServerError {
@@ -99,17 +99,14 @@ impl PiqlServer {
                             writer.finish(&mut collected.clone()).unwrap();
                         }
 
-                        // Send header
+                        // Send combined header + binary
                         let header = ServerMessage::ResultHeader {
                             name: name.clone(),
                             tick,
                             size: buf.len(),
                         };
-                        let header_json = serde_json::to_string(&header).unwrap();
-                        let _ = client.tx.send(Message::Text(header_json.into()));
-
-                        // Send binary data
-                        let _ = client.tx.send(Message::Binary(buf.into()));
+                        let combined = encode_binary_result(&header, &buf);
+                        let _ = client.tx.send(Message::Binary(combined.into()));
                     }
                     Ok(_) => {
                         let err = ServerMessage::Error {
@@ -264,14 +261,12 @@ fn handle_message(
                         writer.finish(&mut collected.clone()).unwrap();
                     }
 
-                    // Send header
+                    // Send combined header + binary
                     let header = ServerMessage::QueryResultHeader { size: buf.len() };
-                    send_message(state, client_id, &header);
-
-                    // Send binary
+                    let combined = encode_binary_result(&header, &buf);
                     let clients = state.clients.lock().unwrap();
                     if let Some(client) = clients.get(&client_id) {
-                        let _ = client.tx.send(Message::Binary(buf.into()));
+                        let _ = client.tx.send(Message::Binary(combined.into()));
                     }
                 }
                 Ok(_) => {

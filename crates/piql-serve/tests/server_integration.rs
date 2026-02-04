@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use piql::QueryEngine;
-use piql_serve::{ClientMessage, PiqlServer, ServerMessage};
+use piql_serve::{decode_binary_result, ClientMessage, PiqlServer, ServerMessage};
 use polars::io::ipc::IpcStreamReader;
 use polars::prelude::*;
 use tokio::net::TcpStream;
@@ -82,8 +82,8 @@ async fn recv_text(ws: &mut WsStream) -> ServerMessage {
     }
 }
 
-/// Receive a binary message (Arrow IPC), with timeout
-async fn recv_binary(ws: &mut WsStream) -> Vec<u8> {
+/// Receive a combined binary message (header + Arrow IPC), with timeout
+async fn recv_result(ws: &mut WsStream) -> (ServerMessage, Vec<u8>) {
     let msg = timeout(Duration::from_secs(2), ws.next())
         .await
         .expect("Timeout waiting for message")
@@ -91,7 +91,10 @@ async fn recv_binary(ws: &mut WsStream) -> Vec<u8> {
         .expect("WebSocket error");
 
     match msg {
-        Message::Binary(data) => data.to_vec(),
+        Message::Binary(data) => {
+            let (header, payload) = decode_binary_result(&data).expect("Invalid binary message");
+            (header, payload.to_vec())
+        }
         other => panic!("Expected binary message, got {:?}", other),
     }
 }
@@ -142,20 +145,16 @@ async fn test_subscribe_and_receive() {
     }
     server.broadcast_tick(1).await.unwrap();
 
-    // Should receive result header
-    let header = recv_text(&mut ws).await;
-    let size = match header {
+    // Should receive combined result
+    let (header, ipc_data) = recv_result(&mut ws).await;
+    match header {
         ServerMessage::ResultHeader { name, tick, size } => {
             assert_eq!(name, "rich");
             assert_eq!(tick, 1);
-            size
+            assert_eq!(ipc_data.len(), size);
         }
         other => panic!("Expected ResultHeader, got {:?}", other),
-    };
-
-    // Should receive Arrow IPC binary
-    let ipc_data = recv_binary(&mut ws).await;
-    assert_eq!(ipc_data.len(), size);
+    }
 
     // Verify we can deserialize the Arrow IPC
     let cursor = std::io::Cursor::new(ipc_data);
@@ -200,11 +199,10 @@ async fn test_multiple_subscriptions() {
     // Should receive two results (order may vary)
     let mut received_names = Vec::new();
     for _ in 0..2 {
-        let header = recv_text(&mut ws).await;
+        let (header, ipc_data) = recv_result(&mut ws).await;
         if let ServerMessage::ResultHeader { name, size, .. } = header {
             received_names.push(name);
-            let _ = recv_binary(&mut ws).await; // consume the IPC data
-            assert!(size > 0);
+            assert_eq!(ipc_data.len(), size);
         }
     }
 
@@ -271,16 +269,14 @@ async fn test_oneoff_query() {
     )
     .await;
 
-    // Should receive result header immediately
-    let header = recv_text(&mut ws).await;
-    let size = match header {
-        ServerMessage::QueryResultHeader { size } => size,
+    // Should receive combined result immediately
+    let (header, ipc_data) = recv_result(&mut ws).await;
+    match header {
+        ServerMessage::QueryResultHeader { size } => {
+            assert_eq!(ipc_data.len(), size);
+        }
         other => panic!("Expected QueryResultHeader, got {:?}", other),
-    };
-
-    // Should receive Arrow IPC
-    let ipc_data = recv_binary(&mut ws).await;
-    assert_eq!(ipc_data.len(), size);
+    }
 
     // Verify data
     let cursor = std::io::Cursor::new(ipc_data);

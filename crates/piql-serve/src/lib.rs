@@ -8,9 +8,10 @@
 pub mod io;
 pub mod protocol;
 pub mod server;
-pub mod util;
 
-pub use protocol::{ClientMessage, ServerMessage};
+pub use protocol::{
+    decode_binary_result, encode_binary_result, ClientMessage, ProtocolError, ServerMessage,
+};
 pub use server::{PiqlServer, ServerError};
 
 pub use piql::{QueryEngine, TimeSeriesConfig};

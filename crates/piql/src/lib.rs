@@ -61,7 +61,7 @@ use thiserror::Error;
 // ============ Primary Public API ============
 
 pub use engine::QueryEngine;
-pub use eval::{EvalContext, TimeSeriesConfig, Value};
+pub use eval::{DataFrameEntry, EvalContext, TimeSeriesConfig, Value};
 
 /// Run a one-off query
 pub fn run(query: &str, ctx: &EvalContext) -> Result<Value, PiqlError> {

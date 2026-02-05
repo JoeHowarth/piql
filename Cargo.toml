@@ -23,6 +23,8 @@ polars = { version = "0.52.0", features = [
     "parquet",
     "csv",
     "ipc_streaming",
+    "ipc",
+    "timezones",
 ] }
 thiserror = "2"
 log = "0.4"

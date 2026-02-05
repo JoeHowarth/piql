@@ -1,0 +1,31 @@
+[package]
+name = "piql-http"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+piql = { path = "../piql" }
+polars.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# HTTP
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+reqwest = { version = "0.12", features = ["json"] }
+
+# OpenAPI
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+# File watching
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+env_logger = "0.11"

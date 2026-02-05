@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 polars.workspace = true
+polars-ops = { version = "0.52.0", features = ["round_series"] }
 thiserror.workspace = true
 log.workspace = true
 winnow = "0.7"

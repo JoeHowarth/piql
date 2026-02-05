@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use polars::prelude::*;
 use polars::series::ops::NullBehavior;
+use polars_ops::series::RoundMode;
 use thiserror::Error;
 
 use crate::ast::core::{CoreArg, Expr};
@@ -343,7 +344,10 @@ fn eval_pl_function(name: &str, args: &[CoreArg], ctx: &EvalContext) -> Result<V
             if col_names.len() == 1 {
                 Ok(Value::Expr(col(&col_names[0])))
             } else {
-                Ok(Value::Expr(cols(col_names)))
+                // cols() returns Selector in polars 0.52+
+                let names: Arc<[PlSmallStr]> = col_names.into_iter().map(PlSmallStr::from).collect();
+                let selector = Selector::ByName { names, strict: true };
+                Ok(Value::Expr(polars::prelude::Expr::Selector(selector)))
             }
         }
         "lit" => {
@@ -400,12 +404,15 @@ fn eval_df_method(
         }
         "drop" => {
             let col_names = collect_string_args(args)?;
-            Ok(Value::DataFrame(df.drop(col_names), source))
+            let names: Arc<[PlSmallStr]> = col_names.into_iter().map(PlSmallStr::from).collect();
+            let selector = Selector::ByName { names, strict: true };
+            Ok(Value::DataFrame(df.drop(selector), source))
         }
         "explode" => {
             let col_names = collect_string_args(args)?;
-            let col_exprs: Vec<_> = col_names.iter().map(col).collect();
-            Ok(Value::DataFrame(df.explode(col_exprs), source))
+            let names: Arc<[PlSmallStr]> = col_names.into_iter().map(PlSmallStr::from).collect();
+            let selector = Selector::ByName { names, strict: true };
+            Ok(Value::DataFrame(df.explode(selector), source))
         }
         "drop_nulls" => Ok(Value::DataFrame(df.drop_nulls(None), source)),
         "reverse" => Ok(Value::DataFrame(df.reverse(), source)),
@@ -623,7 +630,7 @@ fn eval_expr_method(
             let high = eval_to_expr(get_positional_arg(args, 1, "is_between")?, ctx)?;
             Ok(Value::Expr(e.is_between(low, high, ClosedInterval::Both)))
         }
-        "diff" => Ok(Value::Expr(e.diff(1, NullBehavior::Ignore))),
+        "diff" => Ok(Value::Expr(e.diff(lit(1), NullBehavior::Ignore))),
         "shift" => {
             let n = get_int_arg(args, 0, "shift")?;
             Ok(Value::Expr(e.shift(lit(n))))
@@ -661,7 +668,7 @@ fn eval_expr_method(
         "abs" => Ok(Value::Expr(e.abs())),
         "round" => {
             let decimals = get_int_arg(args, 0, "round")? as u32;
-            Ok(Value::Expr(e.round(decimals)))
+            Ok(Value::Expr(e.round(decimals, RoundMode::HalfToEven)))
         }
         "len" => Ok(Value::Expr(e.len())),
         "n_unique" => Ok(Value::Expr(e.n_unique())),

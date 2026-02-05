@@ -71,7 +71,8 @@ pub struct TimeSeriesConfig {
 /// A registered dataframe with optional time-series config
 #[derive(Clone)]
 pub struct DataFrameEntry {
-    pub df: LazyFrame,
+    /// Materialized DataFrame (collected on insert for fast repeated access)
+    pub df: DataFrame,
     pub time_series: Option<TimeSeriesConfig>,
 }
 
@@ -87,6 +88,7 @@ pub struct BaseTableEntry {
 }
 
 /// Evaluation context - holds named dataframes and configuration
+#[derive(Clone)]
 pub struct EvalContext {
     pub dataframes: HashMap<String, DataFrameEntry>,
     /// Base tables with all/now ptrs for implicit now scoping
@@ -107,8 +109,21 @@ impl EvalContext {
         }
     }
 
-    /// Add a regular (non-time-series) dataframe
+    /// Add a regular (non-time-series) dataframe (collects immediately)
     pub fn with_df(mut self, name: impl Into<String>, df: LazyFrame) -> Self {
+        let collected = df.collect().expect("failed to collect DataFrame");
+        self.dataframes.insert(
+            name.into(),
+            DataFrameEntry {
+                df: collected,
+                time_series: None,
+            },
+        );
+        self
+    }
+
+    /// Add a pre-collected dataframe
+    pub fn with_materialized_df(mut self, name: impl Into<String>, df: DataFrame) -> Self {
         self.dataframes.insert(
             name.into(),
             DataFrameEntry {
@@ -119,17 +134,18 @@ impl EvalContext {
         self
     }
 
-    /// Add a time-series dataframe with tick column and partition key
+    /// Add a time-series dataframe with tick column and partition key (collects immediately)
     pub fn with_time_series_df(
         mut self,
         name: impl Into<String>,
         df: LazyFrame,
         config: TimeSeriesConfig,
     ) -> Self {
+        let collected = df.collect().expect("failed to collect DataFrame");
         self.dataframes.insert(
             name.into(),
             DataFrameEntry {
-                df,
+                df: collected,
                 time_series: Some(config),
             },
         );
@@ -179,10 +195,11 @@ impl EvalContext {
             entry.all = Some(all.clone());
             entry.now = Some(now);
             // Also update dataframes to point to `all` (for non-base-table-aware code paths)
+            let collected = all.collect().expect("failed to collect base table");
             self.dataframes.insert(
                 name.to_string(),
                 DataFrameEntry {
-                    df: all,
+                    df: collected,
                     time_series: Some(entry.config.clone()),
                 },
             );
@@ -237,7 +254,7 @@ fn eval_ident(name: &str, ctx: &EvalContext) -> Result<Value> {
             }
             // Otherwise check regular dataframes
             if let Some(entry) = ctx.dataframes.get(name) {
-                Ok(Value::DataFrame(entry.df.clone(), None))
+                Ok(Value::DataFrame(entry.df.clone().lazy(), None))
             } else {
                 Err(EvalError::UnknownIdent(name.to_string()))
             }
@@ -360,6 +377,10 @@ fn eval_pl_function(name: &str, args: &[CoreArg], ctx: &EvalContext) -> Result<V
                 )),
             }
         }
+        "len" => {
+            // pl.len() returns row count expression (like SQL COUNT(*))
+            Ok(Value::Expr(polars::prelude::len()))
+        }
         _ => Err(EvalError::UnknownMethod {
             target: "pl".to_string(),
             method: name.to_string(),
@@ -416,6 +437,33 @@ fn eval_df_method(
         }
         "drop_nulls" => Ok(Value::DataFrame(df.drop_nulls(None), source)),
         "reverse" => Ok(Value::DataFrame(df.reverse(), source)),
+        "unique" => {
+            // df.unique() or df.unique(["col1", "col2"])
+            let subset = if args.is_empty() {
+                None
+            } else {
+                let col_names = get_strings_arg(args, 0, "unique")?;
+                let names: Arc<[PlSmallStr]> = col_names.into_iter().map(PlSmallStr::from).collect();
+                Some(Selector::ByName { names, strict: true })
+            };
+            Ok(Value::DataFrame(df.unique(subset, UniqueKeepStrategy::Any), source))
+        }
+        "count" => {
+            // Returns non-null count per column (like pandas df.count())
+            let schema = df.clone().collect_schema()?;
+            let count_exprs: Vec<polars::prelude::Expr> = schema
+                .iter()
+                .map(|(name, _)| col(name.as_str()).count().alias(name.as_str()))
+                .collect();
+            Ok(Value::DataFrame(df.select(count_exprs), None))
+        }
+        "height" => {
+            // Returns single-row DataFrame with row count
+            Ok(Value::DataFrame(
+                df.select([polars::prelude::len().alias("height")]),
+                None,
+            ))
+        }
         "group_by" => {
             let col_names = collect_string_args(args)?;
             let col_exprs: Vec<_> = col_names.iter().map(col).collect();
@@ -536,6 +584,59 @@ fn eval_df_method(
             let sort_col = get_string_arg(args, 1, "top")?;
             let opts = SortMultipleOptions::new().with_order_descending(true);
             Ok(Value::DataFrame(df.sort([sort_col], opts).limit(n), source))
+        }
+        "describe" => {
+            // Build describe statistics via lazy aggregations (no blocking collect)
+            // Returns: statistic, col1, col2, ... for numeric columns
+            let schema = df.clone().collect_schema()?;
+            let numeric_cols: Vec<_> = schema
+                .iter()
+                .filter(|(_, dtype)| dtype.is_primitive_numeric() || dtype.is_float())
+                .map(|(name, _)| name.to_string())
+                .collect();
+
+            if numeric_cols.is_empty() {
+                return Err(EvalError::Other(
+                    "describe() requires at least one numeric column".into(),
+                ));
+            }
+
+            // Build a lazy row for each statistic
+            let stats = ["count", "null_count", "mean", "std", "min", "max"];
+            let rows: Vec<LazyFrame> = stats
+                .iter()
+                .map(|&stat| {
+                    let exprs: Vec<polars::prelude::Expr> = numeric_cols
+                        .iter()
+                        .map(|c| {
+                            let e = col(c);
+                            match stat {
+                                "count" => e.count().cast(DataType::Float64).alias(c),
+                                "null_count" => e.null_count().cast(DataType::Float64).alias(c),
+                                "mean" => e.mean().alias(c),
+                                "std" => e.std(1).alias(c),
+                                "min" => e.min().cast(DataType::Float64).alias(c),
+                                "max" => e.max().cast(DataType::Float64).alias(c),
+                                _ => unreachable!(),
+                            }
+                        })
+                        .collect();
+
+                    df.clone()
+                        .select(exprs)
+                        .with_column(lit(stat).alias("statistic"))
+                })
+                .collect();
+
+            // Concat all rows lazily
+            let result = polars::prelude::concat(rows, UnionArgs::default())?;
+
+            // Reorder columns to put statistic first
+            let mut col_order: Vec<polars::prelude::Expr> = vec![col("statistic")];
+            col_order.extend(numeric_cols.iter().map(|c| col(c)));
+            let result = result.select(col_order);
+
+            Ok(Value::DataFrame(result, None))
         }
         "join" => {
             // Get the other dataframe (first positional arg)
@@ -889,38 +990,64 @@ fn get_positional_arg<'a>(args: &'a [CoreArg], idx: usize, fn_name: &str) -> Res
     )))
 }
 
-fn get_string_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<String> {
-    let expr = get_positional_arg(args, idx, fn_name)?;
-    if let Expr::Literal(Literal::String(s)) = expr {
-        Ok(s.clone())
-    } else {
-        Err(EvalError::ArgError(format!(
-            "{fn_name}() argument {idx} must be a string"
-        )))
+/// Try to extract column name from either:
+/// - String literal: "col_name"
+/// - pl.col call: pl.col("col_name") or $col_name (desugared)
+fn try_extract_col_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Literal(Literal::String(s)) => Some(s.clone()),
+        // pl.col("name") -> Call(Attr(Ident("pl"), "col"), [Positional(Literal(String(name)))])
+        Expr::Call(callee, args) => {
+            if let Expr::Attr(base, method) = callee.as_ref()
+                && method == "col"
+                && let Expr::Ident(ident) = base.as_ref()
+                && ident == "pl"
+                && args.len() == 1
+                && let Arg::Positional(arg_expr) = &args[0]
+                && let Expr::Literal(Literal::String(name)) = arg_expr
+            {
+                Some(name.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
-/// Get a positional arg that can be either a single string or a list of strings
+fn get_string_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<String> {
+    let expr = get_positional_arg(args, idx, fn_name)?;
+    try_extract_col_name(expr).ok_or_else(|| {
+        EvalError::ArgError(format!("{fn_name}() argument {idx} must be a string"))
+    })
+}
+
+/// Get a positional arg that can be either a single string/col or a list of strings/cols
 fn get_strings_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<Vec<String>> {
     let expr = get_positional_arg(args, idx, fn_name)?;
-    match expr {
-        Expr::Literal(Literal::String(s)) => Ok(vec![s.clone()]),
-        Expr::List(items) => items
+
+    // Single value (string or pl.col)
+    if let Some(name) = try_extract_col_name(expr) {
+        return Ok(vec![name]);
+    }
+
+    // List of strings/cols
+    if let Expr::List(items) = expr {
+        return items
             .iter()
             .map(|e| {
-                if let Expr::Literal(Literal::String(s)) = e {
-                    Ok(s.clone())
-                } else {
-                    Err(EvalError::ArgError(format!(
-                        "{fn_name}() argument {idx} must be a string or list of strings"
-                    )))
-                }
+                try_extract_col_name(e).ok_or_else(|| {
+                    EvalError::ArgError(format!(
+                        "{fn_name}() argument {idx} must be a column name or list of column names"
+                    ))
+                })
             })
-            .collect(),
-        _ => Err(EvalError::ArgError(format!(
-            "{fn_name}() argument {idx} must be a string or list of strings"
-        ))),
+            .collect();
     }
+
+    Err(EvalError::ArgError(format!(
+        "{fn_name}() argument {idx} must be a column name or list of column names"
+    )))
 }
 
 fn get_int_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<i64> {
@@ -959,37 +1086,29 @@ fn get_kwarg_string(args: &[CoreArg], name: &str) -> Option<String> {
     for arg in args {
         if let Arg::Keyword(k, v) = arg
             && k == name
-            && let Expr::Literal(Literal::String(s)) = v
         {
-            return Some(s.clone());
+            return try_extract_col_name(v);
         }
     }
     None
 }
 
-/// Get a kwarg that can be either a single string or a list of strings
+/// Get a kwarg that can be either a single string/col or a list of strings/cols
 fn get_kwarg_strings(args: &[CoreArg], name: &str) -> Option<Vec<String>> {
     for arg in args {
         if let Arg::Keyword(k, v) = arg
             && k == name
         {
-            match v {
-                Expr::Literal(Literal::String(s)) => return Some(vec![s.clone()]),
-                Expr::List(items) => {
-                    let strings: Option<Vec<_>> = items
-                        .iter()
-                        .map(|e| {
-                            if let Expr::Literal(Literal::String(s)) = e {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    return strings;
-                }
-                _ => return None,
+            // Single value
+            if let Some(s) = try_extract_col_name(v) {
+                return Some(vec![s]);
             }
+            // List of values
+            if let Expr::List(items) = v {
+                let strings: Option<Vec<_>> = items.iter().map(try_extract_col_name).collect();
+                return strings;
+            }
+            return None;
         }
     }
     None
@@ -999,10 +1118,23 @@ fn collect_string_args(args: &[CoreArg]) -> Result<Vec<String>> {
     let mut strings = Vec::new();
     for arg in args {
         if let Arg::Positional(e) = arg {
-            if let Expr::Literal(Literal::String(s)) = e {
-                strings.push(s.clone());
+            // Check if it's a list of strings: ["a", "b", "c"]
+            if let Expr::List(items) = e {
+                for item in items {
+                    if let Some(name) = try_extract_col_name(item) {
+                        strings.push(name);
+                    } else {
+                        return Err(EvalError::ArgError(
+                            "Expected column name or pl.col() expression in list".to_string(),
+                        ));
+                    }
+                }
+            } else if let Some(name) = try_extract_col_name(e) {
+                strings.push(name);
             } else {
-                return Err(EvalError::ArgError("Expected string argument".to_string()));
+                return Err(EvalError::ArgError(
+                    "Expected column name or pl.col() expression".to_string(),
+                ));
             }
         }
     }

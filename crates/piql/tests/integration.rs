@@ -156,6 +156,23 @@ fn sort_descending() {
     assert_eq!(gold.get(2).unwrap(), 50);
 }
 
+#[test]
+fn sort_with_col_shorthand() {
+    let ctx = setup_test_df();
+    let df = run_to_df(r#"entities.sort($gold)"#, &ctx);
+    let gold = df.column("gold").unwrap().i32().unwrap();
+    assert_eq!(gold.get(0).unwrap(), 50);
+    assert_eq!(gold.get(2).unwrap(), 250);
+}
+
+#[test]
+fn sort_with_pl_col() {
+    let ctx = setup_test_df();
+    let df = run_to_df(r#"entities.sort(pl.col("gold"), descending=True)"#, &ctx);
+    let gold = df.column("gold").unwrap().i32().unwrap();
+    assert_eq!(gold.get(0).unwrap(), 250);
+}
+
 // ============ Head ============
 
 #[test]
@@ -407,6 +424,50 @@ fn group_by_multiple_columns() {
     assert_eq!(result.height(), 4); // 4 unique (a, b) combinations
 }
 
+#[test]
+fn group_by_list_syntax() {
+    // group_by(["a", "b"]) list syntax
+    let df = df! {
+        "a" => &["x", "x", "y", "y"],
+        "b" => &[1, 2, 1, 2],
+        "val" => &[10, 20, 30, 40],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("df", df);
+    let result = run_to_df(
+        r#"df.group_by(["a", "b"]).agg(pl.col("val").sum().alias("total"))"#,
+        &ctx,
+    );
+    assert_eq!(result.height(), 4); // 4 unique (a, b) combinations
+}
+
+#[test]
+fn group_by_with_col_shorthand() {
+    let ctx = setup_test_df();
+    let df = run_to_df(r#"entities.group_by($type).agg(pl.col("gold").sum())"#, &ctx);
+    assert_eq!(df.height(), 2); // merchant and producer
+}
+
+#[test]
+fn drop_with_col_shorthand() {
+    let ctx = setup_test_df();
+    let df = run_to_df(r#"entities.drop($gold)"#, &ctx);
+    assert!(df.column("gold").is_err());
+    assert!(df.column("name").is_ok());
+}
+
+#[test]
+fn over_with_col_shorthand() {
+    let ctx = setup_test_df();
+    let df = run_to_df(
+        r#"entities.with_columns(pl.col("gold").sum().over($type).alias("type_total"))"#,
+        &ctx,
+    );
+    assert!(df.column("type_total").is_ok());
+}
+
 // ============ join ============
 
 #[test]
@@ -567,6 +628,30 @@ fn unique_values() {
     let ctx = setup_test_df();
     let df = run_to_df(r#"entities.select(pl.col("type").unique())"#, &ctx);
     assert_eq!(df.height(), 2); // merchant, producer
+}
+
+#[test]
+fn df_unique_all_columns() {
+    // DataFrame.unique() deduplicates based on all columns
+    let df = df!(
+        "a" => [1, 1, 2, 2],
+        "b" => ["x", "x", "y", "z"]
+    ).unwrap().lazy();
+    let ctx = EvalContext::new().with_df("test", df);
+    let result = run_to_df(r#"test.unique()"#, &ctx);
+    assert_eq!(result.height(), 3); // (1,x), (2,y), (2,z)
+}
+
+#[test]
+fn df_unique_subset() {
+    // DataFrame.unique(["col"]) deduplicates based on subset
+    let df = df!(
+        "a" => [1, 1, 2, 2],
+        "b" => ["x", "y", "z", "w"]
+    ).unwrap().lazy();
+    let ctx = EvalContext::new().with_df("test", df);
+    let result = run_to_df(r#"test.unique(["a"])"#, &ctx);
+    assert_eq!(result.height(), 2); // one row per unique 'a'
 }
 
 // ============ limit / tail ============
@@ -1513,4 +1598,189 @@ fn base_table_window_scope() {
     } else {
         panic!("Expected DataFrame");
     }
+}
+
+// ============ describe ============
+
+#[test]
+fn describe_basic() {
+    let ctx = setup_test_df();
+    let df = run_to_df("entities.describe()", &ctx);
+
+    // Should have statistic column and gold column (only numeric)
+    assert!(df.column("statistic").is_ok());
+    assert!(df.column("gold").is_ok());
+
+    // Should have 6 rows: count, null_count, mean, std, min, max
+    assert_eq!(df.height(), 6);
+
+    // Check statistic names
+    let stats: Vec<_> = df
+        .column("statistic")
+        .unwrap()
+        .str()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.unwrap().to_string())
+        .collect();
+    assert_eq!(stats, vec!["count", "null_count", "mean", "std", "min", "max"]);
+}
+
+#[test]
+fn describe_mixed_dtypes() {
+    // Test with various column types
+    let df = df! {
+        "int_col" => &[1i64, 2, 3],
+        "float_col" => &[1.0f64, 2.0, 3.0],
+        "str_col" => &["a", "b", "c"],
+        "bool_col" => &[true, false, true],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("test", df);
+    let result = run_to_df("test.describe()", &ctx);
+
+    // Should only include numeric columns
+    assert!(result.column("int_col").is_ok());
+    assert!(result.column("float_col").is_ok());
+    assert!(result.column("str_col").is_err(), "str should be excluded");
+    assert!(result.column("bool_col").is_err(), "bool should be excluded");
+}
+
+#[test]
+fn describe_with_array_dtype() {
+    // Test with fixed-size array column (dtype-array feature)
+    let arr1 = Series::new("".into(), &[1.0f64, 2.0, 3.0]);
+    let arr2 = Series::new("".into(), &[4.0f64, 5.0, 6.0]);
+    
+    let df = df! {
+        "id" => &[1, 2],
+        "value" => &[10.0, 20.0],
+        "coords" => &[arr1, arr2],  // This becomes a List column
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("test", df);
+    let result = run_to_df("test.describe()", &ctx);
+
+    // Should include id and value, exclude coords (list type)
+    assert!(result.column("id").is_ok());
+    assert!(result.column("value").is_ok());
+    assert!(result.column("coords").is_err(), "list should be excluded");
+}
+
+#[test]
+fn describe_no_numeric_columns() {
+    let df = df! {
+        "name" => &["a", "b", "c"],
+        "active" => &[true, false, true],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("test", df);
+    let result = run("test.describe()", &ctx);
+    
+    match result {
+        Err(e) => {
+            let err = e.to_string();
+            assert!(err.contains("numeric"), "Error should mention numeric: {}", err);
+        }
+        Ok(_) => panic!("Should error with no numeric columns"),
+    }
+}
+
+// ============ pl.len() ============
+
+#[test]
+fn pl_len_in_select() {
+    let ctx = setup_test_df();
+    let df = run_to_df("entities.select(pl.len())", &ctx);
+    assert_eq!(df.height(), 1);
+    assert_eq!(df.column("len").unwrap().u32().unwrap().get(0).unwrap(), 3);
+}
+
+#[test]
+fn pl_len_in_group_by() {
+    let ctx = setup_test_df();
+    let df = run_to_df(
+        r#"entities.group_by("type").agg(pl.len().alias("count"))"#,
+        &ctx,
+    );
+    assert_eq!(df.height(), 2); // merchant and producer
+    let total: u32 = df.column("count").unwrap().u32().unwrap().sum().unwrap();
+    assert_eq!(total, 3);
+}
+
+// ============ df.count() ============
+
+#[test]
+fn df_count_basic() {
+    let ctx = setup_test_df();
+    let df = run_to_df("entities.count()", &ctx);
+
+    // Should have one row with counts per column
+    assert_eq!(df.height(), 1);
+
+    // All columns should have count 3 (no nulls in test data)
+    assert_eq!(
+        df.column("name").unwrap().u32().unwrap().get(0).unwrap(),
+        3
+    );
+    assert_eq!(
+        df.column("gold").unwrap().u32().unwrap().get(0).unwrap(),
+        3
+    );
+}
+
+#[test]
+fn df_count_with_nulls() {
+    let df = df! {
+        "a" => &[Some(1), Some(2), None],
+        "b" => &[Some("x"), None, None],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("test", df);
+    let result = run_to_df("test.count()", &ctx);
+
+    assert_eq!(result.height(), 1);
+    assert_eq!(
+        result.column("a").unwrap().u32().unwrap().get(0).unwrap(),
+        2
+    ); // 2 non-null
+    assert_eq!(
+        result.column("b").unwrap().u32().unwrap().get(0).unwrap(),
+        1
+    ); // 1 non-null
+}
+
+// ============ df.height ============
+
+#[test]
+fn df_height_basic() {
+    let ctx = setup_test_df();
+    let df = run_to_df("entities.height()", &ctx);
+
+    assert_eq!(df.height(), 1);
+    assert!(df.column("height").is_ok());
+    assert_eq!(
+        df.column("height").unwrap().u32().unwrap().get(0).unwrap(),
+        3
+    );
+}
+
+#[test]
+fn df_height_after_filter() {
+    let ctx = setup_test_df();
+    let df = run_to_df(r#"entities.filter(pl.col("gold") > 100).height()"#, &ctx);
+
+    assert_eq!(df.height(), 1);
+    assert_eq!(
+        df.column("height").unwrap().u32().unwrap().get(0).unwrap(),
+        1
+    ); // only bob has gold > 100
 }

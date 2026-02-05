@@ -44,13 +44,13 @@ entities.with_columns(
 ## Supported Features
 
 **DataFrame methods**
-`filter`, `select`, `with_columns`, `head`, `tail`, `sort`, `drop`, `explode`, `group_by`, `join`, `rename`, `drop_nulls`, `reverse`, `all`, `window`, `since`, `at`, `top`
+`filter`, `select`, `with_columns`, `head`, `tail`, `sort`, `drop`, `explode`, `group_by`, `join`, `rename`, `drop_nulls`, `reverse`, `unique`, `describe`, `count`, `height`, `all`, `window`, `since`, `at`, `top`
 
 **Expr methods**
 `alias`, `over`, `is_between`, `diff`, `shift`, `sum`, `mean`, `min`, `max`, `count`, `first`, `last`, `cast`, `fill_null`, `is_null`, `is_not_null`, `unique`, `abs`, `round`, `len`, `n_unique`, `cum_sum`, `cum_max`, `cum_min`, `rank`, `clip`, `reverse`
 
 **pl functions**
-`col`, `lit`, `when`/`then`/`otherwise`
+`col`, `lit`, `len`, `when`/`then`/`otherwise`
 
 **str namespace**
 `starts_with`, `ends_with`, `to_lowercase`, `to_uppercase`, `len_chars`, `contains`, `replace`, `slice`
@@ -98,3 +98,34 @@ ctx.sugar.register_directive("merchant", |_, _| {
 let result = run(r#"entities.filter($gold > 100)"#, &ctx)?;
 let result = run(r#"entities.window(-50, 0).filter(@merchant)"#, &ctx)?;
 ```
+
+## piql-server
+
+HTTP server for querying DataFrames via PiQL.
+
+```bash
+# Serve files from a directory
+piql-server ./data/
+
+# Concat mode: recursively scan and concatenate files with the same name
+piql-server --concat ~/dfs/
+```
+
+Concat mode is useful for chunked data:
+```
+~/dfs/
+  50_000_000/
+    slot_updates.parquet
+    tx_header.parquet
+  50_100_000/
+    slot_updates.parquet
+    tx_header.parquet
+```
+Creates DataFrames `slot_updates` and `tx_header` with all chunks concatenated.
+
+**Endpoints:**
+- `POST /query` - Execute PiQL query, returns JSON
+- `GET /dataframes` - List available DataFrames
+- `GET /subscribe?query=<query>` - SSE subscription
+- `POST /ask` - Natural language query (requires `llm` feature)
+- `GET /swagger-ui` - API documentation

@@ -66,37 +66,39 @@ impl QueryEngine {
         }
     }
 
-    /// Add a base dataframe (not time-series)
+    /// Add a base dataframe (not time-series, collects immediately)
     pub fn add_base_df(&mut self, name: impl Into<String>, df: LazyFrame) {
+        let collected = df.collect().expect("failed to collect DataFrame");
         self.ctx.dataframes.insert(
             name.into(),
             crate::eval::DataFrameEntry {
-                df,
+                df: collected,
                 time_series: None,
             },
         );
     }
 
-    /// Add a time-series dataframe
+    /// Add a time-series dataframe (collects immediately)
     pub fn add_time_series_df(
         &mut self,
         name: impl Into<String>,
         df: LazyFrame,
         config: TimeSeriesConfig,
     ) {
+        let collected = df.collect().expect("failed to collect DataFrame");
         self.ctx.dataframes.insert(
             name.into(),
             crate::eval::DataFrameEntry {
-                df,
+                df: collected,
                 time_series: Some(config),
             },
         );
     }
 
-    /// Update a base dataframe (e.g., after appending new rows)
+    /// Update a base dataframe (e.g., after appending new rows, collects immediately)
     pub fn update_df(&mut self, name: &str, df: LazyFrame) {
         if let Some(entry) = self.ctx.dataframes.get_mut(name) {
-            entry.df = df;
+            entry.df = df.collect().expect("failed to collect DataFrame");
         }
     }
 
@@ -171,11 +173,12 @@ impl QueryEngine {
 
         // Evaluate immediately
         let result = run(&query, &self.ctx)?;
-        if let Value::DataFrame(df, _) = result {
+        if let Value::DataFrame(lf, _) = result {
+            let collected = lf.collect().map_err(crate::eval::EvalError::from)?;
             self.ctx.dataframes.insert(
                 name.clone(),
                 crate::eval::DataFrameEntry {
-                    df,
+                    df: collected,
                     time_series: None,
                 },
             );
@@ -206,12 +209,13 @@ impl QueryEngine {
         // 1. Re-evaluate materialized tables in order
         for (name, query) in &self.materialized {
             let result = run(query, &self.ctx)?;
-            if let Value::DataFrame(df, _) = result {
+            if let Value::DataFrame(lf, _) = result {
                 // Store as new DF entry (no time-series config for derived tables)
+                let collected = lf.collect().map_err(crate::eval::EvalError::from)?;
                 self.ctx.dataframes.insert(
                     name.clone(),
                     crate::eval::DataFrameEntry {
-                        df,
+                        df: collected,
                         time_series: None,
                     },
                 );

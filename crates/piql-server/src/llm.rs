@@ -1,9 +1,25 @@
 //! Natural language to PiQL query generation using LLMs
+//!
+//! This module is feature-gated behind the `llm` feature.
 
+use std::sync::Arc;
+
+use axum::extract::{Query, State};
+use axum::http::{header, HeaderName, HeaderValue};
+use axum::response::IntoResponse;
+use log::{debug, info, warn};
 use piql::EvalContext;
 use polars::prelude::*;
+use serde::Deserialize;
+use utoipa::{IntoParams, OpenApi};
 
-use crate::state::AppError;
+use crate::core::ServerCore;
+
+/// OpenAPI documentation for LLM endpoints
+#[derive(OpenApi)]
+#[openapi(paths(ask))]
+pub struct LlmApiDoc;
+use crate::http::AppError;
 
 // ============ Natural Language to PiQL ============
 
@@ -31,6 +47,11 @@ pub const PIQL_DOCS: &str = r#"PiQL is a text query language for Polars datafram
 
 **Sugar**
 - `$col` → `pl.col("col")`
+
+**Important: Operator Precedence**
+When aliasing arithmetic expressions, you MUST wrap the expression in parentheses:
+- CORRECT: `(pl.col("a") - pl.col("b")).alias("diff")`
+- WRONG: `pl.col("a") - pl.col("b").alias("diff")` (aliases "b", not the difference)
 "#;
 
 /// Example query templates - {table}, {str_col}, {num_col}, {cat_col} are placeholders
@@ -42,13 +63,15 @@ const EXAMPLE_TEMPLATES: &[(&str, &str)] = &[
     ("Head", "{table}.head(5)"),
     ("Group by + count", "{table}.group_by(\"{cat_col}\").agg(pl.col(\"{str_col}\").count().alias(\"count\"))"),
     ("String contains", "{table}.filter(pl.col(\"{str_col}\").str.contains(\"{str_fragment}\"))"),
+    ("Multiply with alias", "{table}.with_columns((pl.col(\"{num_col}\") * 2).alias(\"doubled\"))"),
+    ("Subtract two columns with alias", "{table}.with_columns((pl.col(\"end\") - pl.col(\"start\")).alias(\"duration\"))"),
 ];
 
 /// Column info extracted from a dataframe
 pub struct ColumnInfo {
     pub str_cols: Vec<String>,
     pub num_cols: Vec<String>,
-    pub cat_col: Option<String>,  // A string column good for grouping (few unique values)
+    pub cat_col: Option<String>,
     pub sample_str: Option<String>,
     pub sample_num: Option<i64>,
     pub sample_cat: Option<String>,
@@ -56,21 +79,18 @@ pub struct ColumnInfo {
 
 /// Get schema info, sample data, and generate examples from actual data
 pub async fn get_schema_and_examples(ctx: &EvalContext) -> (String, String) {
-    // Clone dataframes for blocking task
     let dfs: Vec<(String, LazyFrame)> = ctx
         .dataframes
         .iter()
-        .map(|(name, entry)| (name.clone(), entry.df.clone()))
+        .map(|(name, entry)| (name.clone(), entry.df.clone().lazy()))
         .collect();
 
-    // Collect samples and column info in blocking task
     let results: Vec<(String, String, ColumnInfo)> = tokio::task::spawn_blocking(move || {
         dfs.into_iter()
             .filter_map(|(name, mut lf)| {
                 let df = lf.clone().slice(0, 5).collect().ok()?;
                 let sample_str = format!("{}", df);
 
-                // Analyze columns
                 let schema = lf.collect_schema().ok()?;
                 let mut str_cols = Vec::new();
                 let mut num_cols = Vec::new();
@@ -85,13 +105,11 @@ pub async fn get_schema_and_examples(ctx: &EvalContext) -> (String, String) {
                     }
                 }
 
-                // Try to find a good categorical column and sample values
                 let mut cat_col = None;
                 let mut sample_cat = None;
                 let mut sample_str_val = None;
                 let mut sample_num = None;
 
-                // Get sample values from first row
                 if df.height() > 0 {
                     for col in &str_cols {
                         if let Ok(series) = df.column(col) {
@@ -100,7 +118,6 @@ pub async fn get_schema_and_examples(ctx: &EvalContext) -> (String, String) {
                                     if sample_str_val.is_none() {
                                         sample_str_val = Some(s.to_string());
                                     }
-                                    // Check if this could be a categorical column (short values)
                                     if s.len() < 20 && cat_col.is_none() {
                                         cat_col = Some(col.clone());
                                         sample_cat = Some(s.to_string());
@@ -133,13 +150,11 @@ pub async fn get_schema_and_examples(ctx: &EvalContext) -> (String, String) {
     .await
     .unwrap_or_default();
 
-    // Build schema info
     let mut schema_info = String::new();
     for (name, sample, _) in &results {
         schema_info.push_str(&format!("## {}\n{}\n\n", name, sample));
     }
 
-    // Generate examples from first suitable table
     let mut examples = String::new();
     if let Some((table, _, info)) = results.iter().find(|(_, _, i)| !i.str_cols.is_empty() && !i.num_cols.is_empty()) {
         let str_col = info.str_cols.first().map(|s| s.as_str()).unwrap_or("name");
@@ -188,7 +203,8 @@ IMPORTANT:
 - Respond with ONLY the PiQL query string
 - Do NOT include any explanation, markdown formatting, or code blocks
 - Do NOT wrap the query in quotes or backticks
-- Just output the raw query that can be executed directly"#,
+- Just output the raw query that can be executed directly
+- CRITICAL: When aliasing arithmetic, ALWAYS use parentheses: `(a - b).alias("x")` NOT `a - b.alias("x")`"#,
         PIQL_DOCS, examples, schema_info
     )
 }
@@ -232,7 +248,7 @@ async fn call_openrouter(api_key: &str, prompt: &str, system: &str) -> Result<St
     Ok(query)
 }
 
-pub async fn call_claude_cli(prompt: &str, system: &str) -> Result<String, AppError> {
+async fn call_claude_cli(prompt: &str, system: &str) -> Result<String, AppError> {
     let full_prompt = format!("{}\n\nUser question: {}", system, prompt);
     let output = tokio::process::Command::new("claude")
         .args(["-p", &full_prompt])
@@ -246,4 +262,108 @@ pub async fn call_claude_cli(prompt: &str, system: &str) -> Result<String, AppEr
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+// ============ Query Validation ============
+
+/// Generate a query, validate it parses, and return pretty-printed. Retries once on failure.
+async fn generate_valid_query(prompt: &str, system: &str) -> Result<String, AppError> {
+    debug!("Generating query for prompt: {}", prompt);
+    let query = generate_query(prompt, system).await?;
+    debug!("LLM returned: {}", query);
+
+    // Try to parse - if it succeeds, return pretty-printed
+    if let Ok(expr) = piql::advanced::parse(&query) {
+        let pretty = piql::advanced::pretty(&expr, 80);
+        info!("Generated valid query ({} chars)", pretty.len());
+        debug!("Query:\n{}", pretty);
+        return Ok(pretty);
+    }
+
+    // Parse failed - retry once
+    warn!("First query attempt failed to parse, retrying...");
+    let query = generate_query(prompt, system).await?;
+    debug!("LLM retry returned: {}", query);
+
+    // Validate the retry and pretty-print
+    let expr = piql::advanced::parse(&query)
+        .map_err(|e| {
+            warn!("Retry also failed: {}", e);
+            AppError(format!("Generated invalid PiQL after retry: {}", e))
+        })?;
+
+    let pretty = piql::advanced::pretty(&expr, 80);
+    info!("Generated valid query on retry ({} chars)", pretty.len());
+    debug!("Query:\n{}", pretty);
+    Ok(pretty)
+}
+
+// ============ HTTP Handler ============
+
+#[derive(Deserialize, IntoParams)]
+pub struct AskParams {
+    /// Execute the generated query and return results
+    #[serde(default)]
+    pub execute: bool,
+}
+
+/// Natural language to PiQL query
+#[utoipa::path(
+    post,
+    path = "/ask",
+    request_body(content = String, content_type = "text/plain", description = "Natural language question"),
+    params(AskParams),
+    responses(
+        (status = 200, description = "Generated query (in X-Piql-Query header) and optionally results"),
+        (status = 400, description = "Error")
+    )
+)]
+pub async fn ask(
+    State(core): State<Arc<ServerCore>>,
+    Query(params): Query<AskParams>,
+    body: String,
+) -> Result<impl IntoResponse, AppError> {
+    info!("POST /ask: {}", body);
+
+    // Get schema info and samples for the prompt
+    let state = core.state();
+    let ctx = state.ctx.read().await;
+    let (schema_info, examples) = get_schema_and_examples(&ctx).await;
+    drop(ctx);
+
+    let system_prompt = build_system_prompt(&schema_info, &examples);
+    info!("Full system prompt:\n{}", system_prompt);
+
+    // Generate query with retry on parse failure
+    let query = generate_valid_query(&body, &system_prompt).await?;
+
+    let response_body = if params.execute {
+        let mut df = core.execute_query(&query).await?;
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, PolarsError> {
+            let mut buf = Vec::new();
+            IpcStreamWriter::new(&mut buf).finish(&mut df)?;
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| AppError(format!("Task join error: {}", e)))?
+        .map_err(|e| AppError(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/vnd.apache.arrow.stream"),
+            ),
+            (
+                HeaderName::from_static("x-piql-query"),
+                HeaderValue::from_str(&query.replace('\n', "\\n"))
+                    .unwrap_or_else(|_| HeaderValue::from_static("")),
+            ),
+        ],
+        response_body,
+    ))
 }

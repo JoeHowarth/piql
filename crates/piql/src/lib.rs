@@ -52,6 +52,7 @@ mod ast;
 mod engine;
 mod eval;
 mod parse;
+mod pretty;
 #[doc(hidden)]
 mod sugar;
 mod transform;
@@ -106,5 +107,6 @@ pub mod advanced {
     pub use crate::ast::{Arg, Literal, UnaryOp};
     pub use crate::eval::eval;
     pub use crate::parse::parse;
+    pub use crate::pretty::pretty;
     pub use crate::transform::{transform, transform_with_sugar};
 }

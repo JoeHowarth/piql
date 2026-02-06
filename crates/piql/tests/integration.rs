@@ -1775,6 +1775,45 @@ fn base_table_window_scope() {
     }
 }
 
+#[test]
+fn update_df_updates_registered_base_table_pointers() {
+    let mut engine = QueryEngine::new();
+    engine.register_base(
+        "entities",
+        TimeSeriesConfig {
+            tick_column: "tick".into(),
+            partition_key: "entity_id".into(),
+        },
+    );
+
+    let tick1 = df! {
+        "tick" => &[1],
+        "entity_id" => &[1],
+        "gold" => &[100],
+    }
+    .unwrap()
+    .lazy();
+    engine.append_tick("entities", tick1).unwrap();
+
+    let replaced = df! {
+        "tick" => &[99],
+        "entity_id" => &[1],
+        "gold" => &[999],
+    }
+    .unwrap()
+    .lazy();
+    engine.update_df("entities", replaced);
+
+    let result = engine.query("entities").unwrap();
+    if let Value::DataFrame(lf, _) = result {
+        let df = lf.collect().unwrap();
+        let gold = df.column("gold").unwrap().i32().unwrap().get(0).unwrap();
+        assert_eq!(gold, 999);
+    } else {
+        panic!("Expected DataFrame");
+    }
+}
+
 // ============ describe ============
 
 #[test]

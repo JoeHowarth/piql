@@ -12,15 +12,6 @@ use std::collections::HashMap;
 use crate::eval::{EvalContext, TimeSeriesConfig};
 use crate::{CompiledQuery, PiqlError, Value, compile, run, run_compiled};
 
-/// State for a base table that grows each tick
-#[derive(Clone)]
-struct BaseTableState {
-    /// All historical data (grows via concat each tick, None until first append)
-    all: Option<LazyFrame>,
-    /// Current tick's data only (None until first append)
-    now: Option<LazyFrame>,
-}
-
 /// Query engine with materialized tables and subscriptions
 ///
 /// # Example
@@ -43,10 +34,6 @@ struct BaseTableState {
 /// ```
 pub struct QueryEngine {
     ctx: EvalContext,
-
-    /// Base tables that grow each tick
-    /// Stores both `all` (full history) and `now` (current tick) ptrs
-    base_tables: HashMap<String, BaseTableState>,
 
     /// Materialized tables: name -> query
     /// Evaluated in insertion order each tick (user ensures correct dependency order)
@@ -89,7 +76,6 @@ impl QueryEngine {
     pub fn new() -> Self {
         Self {
             ctx: EvalContext::new(),
-            base_tables: HashMap::new(),
             materialized: IndexMap::new(),
             subscriptions: HashMap::new(),
         }
@@ -126,6 +112,12 @@ impl QueryEngine {
 
     /// Update a base dataframe (e.g., after appending new rows, collects immediately)
     pub fn update_df(&mut self, name: &str, df: LazyFrame) {
+        if self.ctx.is_base_table(name) {
+            // Replace both all/now pointers for registered base tables.
+            self.ctx.update_base_table_ptrs(name, df.clone(), df);
+            return;
+        }
+
         if let Some(entry) = self.ctx.dataframes.get_mut(name) {
             entry.df = df.collect().expect("failed to collect DataFrame");
         }
@@ -143,17 +135,8 @@ impl QueryEngine {
     /// - `entities.all().filter(...)` → uses full history
     /// - `entities.window(-10, 0).filter(...)` → uses history with tick filter
     pub fn register_base(&mut self, name: impl Into<String>, config: TimeSeriesConfig) {
-        let name = name.into();
         // Register config in eval context (it holds the config for scope method routing)
-        self.ctx.register_base_table(name.clone(), config);
-        // Initialize with empty state (will be populated on first append_tick)
-        self.base_tables.insert(
-            name,
-            BaseTableState {
-                all: None,
-                now: None,
-            },
-        );
+        self.ctx.register_base_table(name.into(), config);
     }
 
     /// Append new tick data to a base table
@@ -162,27 +145,18 @@ impl QueryEngine {
     /// - Replaces `now` with the new rows
     /// - Both share the underlying Arrow arrays (no data copy)
     pub fn append_tick(&mut self, name: &str, rows: LazyFrame) -> Result<(), PiqlError> {
-        let state = self
-            .base_tables
-            .get_mut(name)
-            .ok_or_else(|| crate::eval::EvalError::UnknownIdent(name.to_string()))?;
+        if !self.ctx.is_base_table(name) {
+            return Err(crate::eval::EvalError::UnknownIdent(name.to_string()).into());
+        }
 
-        // Concat or initialize
-        state.all = Some(match state.all.take() {
+        let all = match self.ctx.get_base_all(name) {
             Some(existing) => concat([existing, rows.clone()], UnionArgs::default())
                 .map_err(crate::eval::EvalError::from)?,
             None => rows.clone(),
-        });
-
-        // Now ptr is just the new rows
-        state.now = Some(rows);
+        };
 
         // Update eval context with current ptrs
-        self.ctx.update_base_table_ptrs(
-            name,
-            state.all.clone().unwrap(),
-            state.now.clone().unwrap(),
-        );
+        self.ctx.update_base_table_ptrs(name, all, rows);
 
         Ok(())
     }

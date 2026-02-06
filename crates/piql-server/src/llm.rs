@@ -112,26 +112,25 @@ pub async fn get_schema_and_examples(ctx: &EvalContext) -> (String, String) {
 
                 if df.height() > 0 {
                     for col in &str_cols {
-                        if let Ok(series) = df.column(col) {
-                            if let Ok(val) = series.str() {
-                                if let Some(s) = val.get(0) {
-                                    if sample_str_val.is_none() {
-                                        sample_str_val = Some(s.to_string());
-                                    }
-                                    if s.len() < 20 && cat_col.is_none() {
-                                        cat_col = Some(col.clone());
-                                        sample_cat = Some(s.to_string());
-                                    }
-                                }
+                        if let Ok(series) = df.column(col)
+                            && let Ok(val) = series.str()
+                            && let Some(s) = val.get(0)
+                        {
+                            if sample_str_val.is_none() {
+                                sample_str_val = Some(s.to_string());
+                            }
+                            if s.len() < 20 && cat_col.is_none() {
+                                cat_col = Some(col.clone());
+                                sample_cat = Some(s.to_string());
                             }
                         }
                     }
                     for col in &num_cols {
-                        if let Ok(series) = df.column(col) {
-                            if let Ok(val) = series.i64() {
-                                sample_num = val.get(0);
-                                break;
-                            }
+                        if let Ok(series) = df.column(col)
+                            && let Ok(val) = series.i64()
+                        {
+                            sample_num = val.get(0);
+                            break;
                         }
                     }
                 }

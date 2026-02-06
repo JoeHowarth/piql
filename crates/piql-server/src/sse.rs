@@ -50,7 +50,7 @@ pub async fn subscribe(
         .filter_map(|_| async { Some(()) });
 
     // Prepend an immediate trigger to emit initial results
-    let trigger_stream = stream::once(async { () }).chain(update_stream);
+    let trigger_stream = stream::once(async {}).chain(update_stream);
 
     // For each trigger, execute the query and emit results
     let query_for_log = query.clone();

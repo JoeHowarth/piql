@@ -5,45 +5,14 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::header;
 use axum::response::IntoResponse;
 use log::{debug, info, warn};
-use polars::prelude::*;
 
 use crate::core::ServerCore;
-use crate::ipc::{IpcEncodeError, dataframe_to_ipc_bytes};
+use crate::error::AppError;
+use crate::ipc::dataframe_to_ipc_bytes;
 use crate::state::{DataframesResponse, ErrorResponse};
-
-/// Application error type
-pub struct AppError(pub String);
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> axum::response::Response {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: self.0 }),
-        )
-            .into_response()
-    }
-}
-
-impl From<piql::PiqlError> for AppError {
-    fn from(e: piql::PiqlError) -> Self {
-        AppError(e.to_string())
-    }
-}
-
-impl From<PolarsError> for AppError {
-    fn from(e: PolarsError) -> Self {
-        AppError(e.to_string())
-    }
-}
-
-impl From<IpcEncodeError> for AppError {
-    fn from(e: IpcEncodeError) -> Self {
-        AppError(e.to_string())
-    }
-}
 
 /// Execute a piql query
 #[utoipa::path(
@@ -71,7 +40,7 @@ pub async fn query(
         }
     };
 
-    let buf = dataframe_to_ipc_bytes(df).await.map_err(AppError::from)?;
+    let buf = dataframe_to_ipc_bytes(df).await?;
 
     info!(
         "Query succeeded in {:.2?}, {} bytes",

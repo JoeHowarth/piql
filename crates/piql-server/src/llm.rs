@@ -14,13 +14,13 @@ use serde::Deserialize;
 use utoipa::{IntoParams, OpenApi};
 
 use crate::core::ServerCore;
+use crate::error::AppError;
 use crate::ipc::dataframe_to_ipc_bytes;
 
 /// OpenAPI documentation for LLM endpoints
 #[derive(OpenApi)]
 #[openapi(paths(ask))]
 pub struct LlmApiDoc;
-use crate::http::AppError;
 
 // ============ Natural Language to PiQL ============
 

@@ -31,6 +31,7 @@
 //! ```
 
 pub mod core;
+pub mod error;
 pub mod http;
 pub mod ipc;
 pub mod loader;
@@ -47,6 +48,7 @@ pub mod watcher;
 
 // Re-exports for convenience
 pub use core::ServerCore;
+pub use error::AppError;
 pub use state::{DfUpdate, SharedState};
 
 use std::sync::Arc;

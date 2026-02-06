@@ -1784,3 +1784,52 @@ fn df_height_after_filter() {
         1
     ); // only bob has gold > 100
 }
+
+// ============ Namespaced identifiers (::) ============
+
+#[test]
+fn namespaced_ident_resolves() {
+    let ctx = setup_test_df();
+    // Register a DF under a namespaced name
+    let df = df! {
+        "x" => &[1, 2],
+    }
+    .unwrap()
+    .lazy();
+    let ctx = ctx.with_df("run1::data", df);
+    let result = run_to_df("run1::data", &ctx);
+    assert_eq!(result.height(), 2);
+}
+
+#[test]
+fn namespaced_ident_with_method_chain() {
+    let df = df! {
+        "name" => &["a", "b", "c"],
+        "val" => &[10, 20, 30],
+    }
+    .unwrap()
+    .lazy();
+    let ctx = EvalContext::new().with_df("_all::items", df);
+    let result = run_to_df(r#"_all::items.filter(pl.col("val") > 15)"#, &ctx);
+    assert_eq!(result.height(), 2);
+}
+
+#[test]
+fn multi_segment_namespace() {
+    let df = df! {
+        "v" => &[42],
+    }
+    .unwrap()
+    .lazy();
+    let ctx = EvalContext::new().with_df("a::b::c", df);
+    let result = run_to_df("a::b::c", &ctx);
+    assert_eq!(result.height(), 1);
+}
+
+#[test]
+fn dot_attr_still_works() {
+    // Ensure :: doesn't break normal dot access
+    let ctx = setup_test_df();
+    let df = run_to_df(r#"entities.filter(pl.col("gold") > 100)"#, &ctx);
+    assert_eq!(df.height(), 1);
+}

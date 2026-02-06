@@ -233,14 +233,32 @@ fn ident(input: &mut &str) -> PResult<String> {
     ident_str.parse_next(input)
 }
 
+fn namespace_segment<'a>(input: &mut &'a str) -> PResult<&'a str> {
+    preceded(
+        "::",
+        (
+            one_of(|c: char| c.is_ascii_alphabetic() || c == '_'),
+            take_while(0.., |c: char| c.is_ascii_alphanumeric() || c == '_'),
+        )
+            .take(),
+    )
+    .parse_next(input)
+}
+
 fn ident_str(input: &mut &str) -> PResult<String> {
-    (
+    let first = (
         one_of(|c: char| c.is_ascii_alphabetic() || c == '_'),
         take_while(0.., |c: char| c.is_ascii_alphanumeric() || c == '_'),
     )
         .take()
-        .map(|s: &str| s.to_string())
-        .parse_next(input)
+        .parse_next(input)?;
+
+    let mut result = first.to_string();
+    while let Some(seg) = opt(namespace_segment).parse_next(input)? {
+        result.push_str("::");
+        result.push_str(seg);
+    }
+    Ok(result)
 }
 
 // ============ Literals ============

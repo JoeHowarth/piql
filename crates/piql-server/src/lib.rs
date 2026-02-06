@@ -40,6 +40,8 @@ pub mod state;
 pub mod llm;
 
 #[cfg(feature = "file-watcher")]
+pub mod runs;
+#[cfg(feature = "file-watcher")]
 pub mod watcher;
 
 // Re-exports for convenience

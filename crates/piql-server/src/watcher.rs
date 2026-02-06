@@ -10,7 +10,8 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use crate::core::ServerCore;
-use crate::loader::{df_name_from_path, is_supported_file, load_file};
+use crate::loader::{df_name_from_path, is_supported_file, load_file, load_file_sync, collect_files};
+use crate::runs::RunRegistry;
 use crate::state::DfUpdate;
 
 /// Watch paths for changes and send updates to ServerCore
@@ -101,4 +102,159 @@ pub async fn load_and_watch(
 
     // Start watching
     FileWatcher::new(core, paths)
+}
+
+// ============ Run Watcher ============
+
+/// Event types sent from the notify callback to the async handler
+enum RunEvent {
+    /// A _ready sentinel appeared in a subdirectory
+    Ready(PathBuf),
+    /// A subdirectory was removed
+    Removed(PathBuf),
+}
+
+/// Watches a parent directory for run subdirectories (sentinel-based).
+/// Owns the RunRegistry — sole mutator, no locking needed.
+pub struct RunWatcher {
+    _watcher: RecommendedWatcher,
+}
+
+
+/// Load all parquet files from a run directory into the registry.
+async fn load_run_dir(
+    registry: &mut RunRegistry,
+    run_name: &str,
+    run_dir: &std::path::Path,
+    core: &ServerCore,
+) {
+    let run_dir_owned = run_dir.to_path_buf();
+    let tables = match tokio::task::spawn_blocking(move || {
+        let files = collect_files(&[run_dir_owned]);
+        let mut tables = std::collections::HashMap::new();
+        for path in files {
+            match load_file_sync(&path) {
+                Ok(df) => {
+                    let name = df_name_from_path(&path);
+                    tables.insert(name, df);
+                }
+                Err(e) => {
+                    log::warn!("Failed to load {}: {}", path.display(), e);
+                }
+            }
+        }
+        tables
+    })
+    .await
+    {
+        Ok(tables) if !tables.is_empty() => tables,
+        Ok(_) => {
+            log::warn!("Run '{}' has no loadable tables, skipping", run_name);
+            return;
+        }
+        Err(e) => {
+            log::error!("Failed to load run '{}': {}", run_name, e);
+            return;
+        }
+    };
+
+    registry.load_run(run_name, tables, core).await;
+}
+
+/// Scan for existing ready runs, load them, then start watching for new ones.
+pub async fn load_and_watch_runs(
+    core: Arc<ServerCore>,
+    parent: PathBuf,
+) -> notify::Result<RunWatcher> {
+    let mut registry = RunRegistry::new();
+
+    // Scan for existing run subdirs with _ready sentinel
+    let mut run_dirs: Vec<_> = std::fs::read_dir(&parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry.path().is_dir() && entry.path().join("_ready").exists()
+        })
+        .collect();
+
+    // Sort by name (timestamp prefix → chronological order)
+    run_dirs.sort_by_key(|e| e.file_name());
+
+    for entry in &run_dirs {
+        let run_dir = entry.path();
+        let Some(run_name) = run_dir.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
+        load_run_dir(&mut registry, run_name, &run_dir, &core).await;
+    }
+
+    // Now start watching — but we need to hand off the registry to the watcher.
+    // The watcher creates its own registry, so we need a different approach:
+    // we build the watcher with pre-loaded registry.
+    RunWatcher::with_registry(core, parent, registry)
+}
+
+impl RunWatcher {
+    fn with_registry(
+        core: Arc<ServerCore>,
+        parent: PathBuf,
+        initial_registry: RunRegistry,
+    ) -> notify::Result<Self> {
+        let (tx, mut rx) = mpsc::channel::<RunEvent>(100);
+
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            if let Ok(event) = res {
+                for path in &event.paths {
+                    if path.file_name().and_then(|f| f.to_str()) == Some("_ready") {
+                        match event.kind {
+                            EventKind::Create(_) => {
+                                let _ = tx.blocking_send(RunEvent::Ready(path.clone()));
+                            }
+                            EventKind::Remove(_) => {
+                                let _ = tx.blocking_send(RunEvent::Removed(path.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if event.kind == EventKind::Remove(notify::event::RemoveKind::Folder) {
+                        let _ = tx.blocking_send(RunEvent::Removed(path.clone()));
+                    }
+                }
+            }
+        })?;
+
+        watcher.watch(&parent, RecursiveMode::Recursive)?;
+
+        tokio::spawn(async move {
+            let mut registry = initial_registry;
+
+            while let Some(event) = rx.recv().await {
+                match event {
+                    RunEvent::Ready(sentinel_path) => {
+                        let Some(run_dir) = sentinel_path.parent() else {
+                            continue;
+                        };
+                        let Some(run_name) = run_dir.file_name().and_then(|f| f.to_str()) else {
+                            continue;
+                        };
+                        load_run_dir(&mut registry, run_name, run_dir, &core).await;
+                    }
+                    RunEvent::Removed(path) => {
+                        let dir = if path.file_name().and_then(|f| f.to_str()) == Some("_ready") {
+                            path.parent().unwrap_or(&path)
+                        } else {
+                            &path
+                        };
+                        let Some(run_name) = dir.file_name().and_then(|f| f.to_str()) else {
+                            continue;
+                        };
+                        registry.remove_run(run_name, &core).await;
+                    }
+                }
+            }
+        });
+
+        Ok(Self { _watcher: watcher })
+    }
 }

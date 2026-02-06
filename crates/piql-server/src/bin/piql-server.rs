@@ -24,6 +24,12 @@ EXAMPLES:
 
     # Multiple directories
     piql-server --concat ~/dfs/chain1/ ~/dfs/chain2/
+
+    # Run-aware mode (watches for new run subdirectories)
+    piql-server --runs ./data/
+
+    # Each subdir with a _ready sentinel is a run:
+    #   data/0206_1430_basic/fill.parquet  → fill, _0206_1430_basic::fill, _all::fill
 ")]
 struct Args {
     /// Paths to parquet/csv/ipc files or directories
@@ -40,8 +46,14 @@ struct Args {
 
     /// Recursively scan directories and concatenate files with the same name.
     /// Use this when data is split across multiple chunk directories.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "runs")]
     concat: bool,
+
+    /// Run-aware mode: watch a parent directory for run subdirectories.
+    /// Each subdirectory with a _ready sentinel file is loaded as a run.
+    /// Tables are exposed as: table (latest), run::table, _all::table.
+    #[arg(long, conflicts_with = "concat")]
+    runs: bool,
 
     /// Maximum rows to return from queries. Default 100000. Use 0 for unlimited.
     #[arg(long, default_value = "100000")]
@@ -62,7 +74,21 @@ async fn main() -> anyhow::Result<()> {
     let core = Arc::new(piql_server::ServerCore::with_max_rows(max_rows));
     log::info!("Max rows per query: {}", max_rows.map_or("unlimited".to_string(), |n| n.to_string()));
 
-    if args.concat {
+    if args.runs {
+        // Run-aware mode: watch parent dir for run subdirectories
+        #[cfg(feature = "file-watcher")]
+        {
+            let parent = &args.paths[0];
+            log::info!("Starting in run-aware mode, watching: {}", parent.display());
+            let _watcher =
+                piql_server::watcher::load_and_watch_runs(core.clone(), parent.clone()).await?;
+        }
+
+        #[cfg(not(feature = "file-watcher"))]
+        {
+            anyhow::bail!("--runs requires the file-watcher feature");
+        }
+    } else if args.concat {
         // Concat mode: recursively scan and concatenate files with same name
         for path in &args.paths {
             match piql_server::loader::load_concat_dir(path).await {

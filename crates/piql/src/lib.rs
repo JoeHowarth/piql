@@ -68,6 +68,7 @@ pub use eval::{DataFrameEntry, DataFrameLineage, EvalContext, TimeSeriesConfig, 
 #[derive(Clone)]
 pub struct CompiledQuery {
     core: ast::core::Expr,
+    query: String,
 }
 
 /// Compile a query once for repeated execution.
@@ -76,12 +77,18 @@ pub fn compile(query: &str, ctx: &EvalContext) -> Result<CompiledQuery, PiqlErro
     let root_df = infer_root_dataframe_name(&surface);
     let sugar_ctx = ctx.sugar_context(root_df);
     let core = transform::transform_with_sugar(surface, &ctx.sugar, &sugar_ctx);
-    Ok(CompiledQuery { core })
+    Ok(CompiledQuery {
+        core,
+        query: query.to_string(),
+    })
 }
 
 /// Run a pre-compiled query.
 pub fn run_compiled(compiled: &CompiledQuery, ctx: &EvalContext) -> Result<Value, PiqlError> {
-    let result = eval::eval(&compiled.core, ctx)?;
+    let result = eval::eval(&compiled.core, ctx).map_err(|source| PiqlError::EvalWithQuery {
+        query: compiled.query.clone(),
+        source,
+    })?;
     Ok(result)
 }
 
@@ -118,6 +125,12 @@ pub enum PiqlError {
     Parse(#[from] parse::ParseError),
     #[error("Eval error: {0}")]
     Eval(#[from] eval::EvalError),
+    #[error("Eval error in query `{query}`: {source}")]
+    EvalWithQuery {
+        query: String,
+        #[source]
+        source: eval::EvalError,
+    },
 }
 
 pub use eval::EvalError;

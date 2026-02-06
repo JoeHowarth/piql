@@ -15,11 +15,18 @@ type PResult<T> = winnow::ModalResult<T>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
     pub message: String,
+    pub offset: usize,
+    pub line: usize,
+    pub column: usize,
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Parse error: {}", self.message)
+        write!(
+            f,
+            "{} (line {}, column {}, offset {})",
+            self.message, self.line, self.column, self.offset
+        )
     }
 }
 
@@ -28,9 +35,62 @@ impl std::error::Error for ParseError {}
 /// Parse a PiQL expression from a string
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
     let input = input.trim();
-    expr.parse(input).map_err(|e| ParseError {
-        message: format!("{:?}", e),
-    })
+    let mut stream = input;
+    match expr.parse_next(&mut stream) {
+        Ok(parsed) => {
+            if stream.trim().is_empty() {
+                Ok(parsed)
+            } else {
+                let offset = trailing_input_offset(input, stream);
+                Err(build_parse_error(
+                    "unexpected trailing input".to_string(),
+                    input,
+                    offset,
+                ))
+            }
+        }
+        Err(e) => {
+            let offset = input.len().saturating_sub(stream.len());
+            Err(build_parse_error(format!("{:?}", e), input, offset))
+        }
+    }
+}
+
+fn build_parse_error(message: String, input: &str, offset: usize) -> ParseError {
+    let (line, column) = offset_to_line_column(input, offset);
+    ParseError {
+        message,
+        offset,
+        line,
+        column,
+    }
+}
+
+fn offset_to_line_column(input: &str, offset: usize) -> (usize, usize) {
+    let bounded = offset.min(input.len());
+    let mut line = 1usize;
+    let mut column = 1usize;
+
+    for ch in input[..bounded].chars() {
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+
+    (line, column)
+}
+
+fn trailing_input_offset(input: &str, trailing: &str) -> usize {
+    let base = input.len().saturating_sub(trailing.len());
+    let non_ws = trailing
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    base + non_ws
 }
 
 // ============ Top-level expression (handles precedence) ============

@@ -1445,6 +1445,30 @@ fn otherwise_without_arg_returns_error() {
 }
 
 #[test]
+fn parse_error_reports_line_and_column() {
+    let ctx = setup_test_df();
+    let err = match run(r#"entities.filter("#, &ctx) {
+        Ok(_) => panic!("expected parse error"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("line 1"), "unexpected error: {msg}");
+    assert!(msg.contains("column"), "unexpected error: {msg}");
+}
+
+#[test]
+fn eval_error_includes_query_context() {
+    let ctx = setup_test_df();
+    let query = r#"entities.not_a_real_method()"#;
+    let err = match run(query, &ctx) {
+        Ok(_) => panic!("expected eval error"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains(query), "unexpected error: {msg}");
+}
+
+#[test]
 fn time_series_df_with_config() {
     let df = df! {
         "entity_id" => &[1, 1, 1, 2, 2, 2],

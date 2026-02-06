@@ -13,7 +13,7 @@ use crate::core::ServerCore;
 use crate::loader::{
     collect_files, df_name_from_path, is_supported_file, load_file, load_file_sync,
 };
-use crate::runs::RunRegistry;
+use crate::runs::{RunRegistry, RunRegistryOptions};
 use crate::state::DfUpdate;
 
 /// Watch paths for changes and send updates to ServerCore
@@ -122,6 +122,11 @@ pub struct RunWatcher {
     _watcher: RecommendedWatcher,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RunModeOptions {
+    pub drop_existing_run_label_column: bool,
+}
+
 /// Load all parquet files from a run directory into the registry.
 async fn load_run_dir(
     registry: &mut RunRegistry,
@@ -159,15 +164,21 @@ async fn load_run_dir(
         }
     };
 
-    registry.load_run(run_name, tables, core).await;
+    if let Err(err) = registry.load_run(run_name, tables, core).await {
+        log::error!("Failed to load run '{}': {}", run_name, err);
+    }
 }
 
 /// Scan for existing ready runs, load them, then start watching for new ones.
 pub async fn load_and_watch_runs(
     core: Arc<ServerCore>,
     parent: PathBuf,
+    options: RunModeOptions,
 ) -> notify::Result<RunWatcher> {
-    let mut registry = RunRegistry::new();
+    let mut registry = RunRegistry::with_options(RunRegistryOptions {
+        drop_existing_run_label_column: options.drop_existing_run_label_column,
+        ..Default::default()
+    });
 
     // Scan for existing run subdirs with _ready sentinel
     let mut run_dirs: Vec<_> = std::fs::read_dir(&parent)

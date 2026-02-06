@@ -3,20 +3,60 @@
 //! Tracks loaded simulation runs and manages the three-tier naming:
 //! - `table` → latest run's version
 //! - `run_name::table` → specific run's version
-//! - `_all::table` → all runs concatenated with `_run` column
+//! - `_all::table` → all runs concatenated with a run-label column (`_run` by default)
 
 use std::collections::HashMap;
 
 use polars::prelude::*;
+use thiserror::Error;
 
 use crate::core::ServerCore;
 use crate::state::DfUpdate;
+
+pub const DEFAULT_RUN_LABEL_COLUMN: &str = "_run";
+
+#[derive(Debug, Clone)]
+pub struct RunRegistryOptions {
+    pub run_label_column: String,
+    pub drop_existing_run_label_column: bool,
+}
+
+impl Default for RunRegistryOptions {
+    fn default() -> Self {
+        Self {
+            run_label_column: DEFAULT_RUN_LABEL_COLUMN.to_string(),
+            drop_existing_run_label_column: false,
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RunRegistryError {
+    #[error(
+        "run '{run_name}' table '{table}' already contains reserved run-label column '{column}'"
+    )]
+    RunLabelColumnConflict {
+        run_name: String,
+        table: String,
+        column: String,
+    },
+    #[error(
+        "failed to drop existing run-label column '{column}' from run '{run_name}' table '{table}': {source}"
+    )]
+    DropRunLabelColumnFailed {
+        run_name: String,
+        table: String,
+        column: String,
+        source: PolarsError,
+    },
+}
 
 pub struct RunRegistry {
     /// Loaded runs in insertion order (oldest first)
     runs: Vec<RunInfo>,
     /// Name of the most recently loaded run
     latest: Option<String>,
+    options: RunRegistryOptions,
 }
 
 struct RunInfo {
@@ -27,9 +67,14 @@ struct RunInfo {
 
 impl RunRegistry {
     pub fn new() -> Self {
+        Self::with_options(RunRegistryOptions::default())
+    }
+
+    pub fn with_options(options: RunRegistryOptions) -> Self {
         Self {
             runs: Vec::new(),
             latest: None,
+            options,
         }
     }
 
@@ -39,21 +84,27 @@ impl RunRegistry {
         run_name: &str,
         tables: HashMap<String, DataFrame>,
         core: &ServerCore,
-    ) {
+    ) -> Result<(), RunRegistryError> {
         if run_name == "_all" {
             log::warn!("Skipping run named '_all' — reserved name");
-            return;
+            return Ok(());
         }
 
         if self.runs.iter().any(|r| r.name == run_name) {
             log::debug!("Run '{}' already loaded, skipping", run_name);
-            return;
+            return Ok(());
         }
 
         let known_tables_before = self.all_table_names();
+        let mut normalized_tables: HashMap<String, DataFrame> = HashMap::new();
         let mut annotated = HashMap::new();
 
-        for (table, df) in &tables {
+        for (table, df) in tables {
+            let normalized = self.normalize_run_table(run_name, &table, df)?;
+            normalized_tables.insert(table, normalized);
+        }
+
+        for (table, df) in &normalized_tables {
             // 1. Register run-specific: run_name::table
             let specific_name = format!("{run_name}::{table}");
             core.insert_df(&specific_name, df.clone()).await;
@@ -69,10 +120,13 @@ impl RunRegistry {
             let with_run = df
                 .clone()
                 .lazy()
-                .with_column(lit(run_name).alias("_run"))
+                .with_column(lit(run_name).alias(&self.options.run_label_column))
                 .collect()
                 .unwrap_or_else(|e| {
-                    log::error!("Failed to add _run column for {specific_name}: {e}");
+                    log::error!(
+                        "Failed to add {} column for {specific_name}: {e}",
+                        self.options.run_label_column
+                    );
                     df.clone()
                 });
             annotated.insert(table.clone(), with_run);
@@ -85,7 +139,7 @@ impl RunRegistry {
         self.latest = Some(run_name.to_string());
 
         // 4. Rebuild _all:: for each table in this run
-        let table_names: Vec<String> = tables.keys().cloned().collect();
+        let table_names: Vec<String> = normalized_tables.keys().cloned().collect();
         for table in &table_names {
             self.rebuild_all(table, core).await;
         }
@@ -98,6 +152,8 @@ impl RunRegistry {
             table_names.len(),
             self.runs.len()
         );
+
+        Ok(())
     }
 
     /// Remove a run and clean up all three tiers.
@@ -185,8 +241,39 @@ impl RunRegistry {
         let latest_name = self.latest.as_deref()?;
         let run = self.runs.iter().find(|r| r.name == latest_name)?;
         let annotated = run.tables.get(table)?;
-        // Strip the _run column to get the bare version
-        Some(annotated.drop("_run").unwrap_or_else(|_| annotated.clone()))
+        // Strip the run-label column to get the bare version
+        Some(
+            annotated
+                .drop(&self.options.run_label_column)
+                .unwrap_or_else(|_| annotated.clone()),
+        )
+    }
+
+    fn normalize_run_table(
+        &self,
+        run_name: &str,
+        table: &str,
+        df: DataFrame,
+    ) -> Result<DataFrame, RunRegistryError> {
+        let run_label_column = &self.options.run_label_column;
+        if df.get_column_index(run_label_column).is_some() {
+            if self.options.drop_existing_run_label_column {
+                return df.drop(run_label_column).map_err(|source| {
+                    RunRegistryError::DropRunLabelColumnFailed {
+                        run_name: run_name.to_string(),
+                        table: table.to_string(),
+                        column: run_label_column.clone(),
+                        source,
+                    }
+                });
+            }
+            return Err(RunRegistryError::RunLabelColumnConflict {
+                run_name: run_name.to_string(),
+                table: table.to_string(),
+                column: run_label_column.clone(),
+            });
+        }
+        Ok(df)
     }
 
     fn all_table_names(&self) -> Vec<String> {
@@ -239,11 +326,11 @@ mod tests {
 
         let mut r1 = HashMap::new();
         r1.insert("a".to_string(), df! { "x" => &[1] }.unwrap());
-        registry.load_run("r1", r1, &core).await;
+        registry.load_run("r1", r1, &core).await.unwrap();
 
         let mut r2 = HashMap::new();
         r2.insert("b".to_string(), df! { "y" => &[2] }.unwrap());
-        registry.load_run("r2", r2, &core).await;
+        registry.load_run("r2", r2, &core).await.unwrap();
 
         let names: HashSet<_> = core.list_dataframes().await.into_iter().collect();
         assert!(names.contains("b"));
@@ -257,15 +344,57 @@ mod tests {
 
         let mut r1 = HashMap::new();
         r1.insert("a".to_string(), df! { "x" => &[1] }.unwrap());
-        registry.load_run("r1", r1, &core).await;
+        registry.load_run("r1", r1, &core).await.unwrap();
 
         let mut r2 = HashMap::new();
         r2.insert("b".to_string(), df! { "y" => &[2] }.unwrap());
-        registry.load_run("r2", r2, &core).await;
+        registry.load_run("r2", r2, &core).await.unwrap();
 
         registry.remove_run("r1", &core).await;
         let names: HashSet<_> = core.list_dataframes().await.into_iter().collect();
         assert!(names.contains("b"));
         assert!(!names.contains("a"));
+    }
+
+    #[tokio::test]
+    async fn load_run_rejects_existing_run_label_column_by_default() {
+        let core = ServerCore::new();
+        let mut registry = RunRegistry::new();
+
+        let mut run = HashMap::new();
+        run.insert(
+            "a".to_string(),
+            df! { "x" => &[1], "_run" => &["existing"] }.unwrap(),
+        );
+        let result = registry.load_run("r1", run, &core).await;
+
+        assert!(matches!(
+            result,
+            Err(RunRegistryError::RunLabelColumnConflict { .. })
+        ));
+        assert!(core.list_dataframes().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_run_can_drop_existing_run_label_column() {
+        let core = ServerCore::new();
+        let mut registry = RunRegistry::with_options(RunRegistryOptions {
+            drop_existing_run_label_column: true,
+            ..Default::default()
+        });
+
+        let mut run = HashMap::new();
+        run.insert(
+            "a".to_string(),
+            df! { "x" => &[1], "_run" => &["existing"] }.unwrap(),
+        );
+        registry.load_run("r1", run, &core).await.unwrap();
+
+        let bare = core.execute_query("a").await.unwrap();
+        assert!(bare.column("_run").is_err());
+
+        let combined = core.execute_query("_all::a").await.unwrap();
+        let run_col = combined.column("_run").unwrap().str().unwrap();
+        assert_eq!(run_col.get(0), Some("r1"));
     }
 }

@@ -55,6 +55,11 @@ struct Args {
     #[arg(long, conflicts_with = "concat")]
     runs: bool,
 
+    /// In --runs mode, automatically drop an existing _run column before labeling _all:: tables.
+    /// By default, loading fails if a source table already contains _run.
+    #[arg(long, requires = "runs")]
+    runs_drop_existing_run_col: bool,
+
     /// Maximum rows to return from queries. Default 100000. Use 0 for unlimited.
     #[arg(long, default_value = "100000")]
     max_rows: u32,
@@ -83,8 +88,14 @@ async fn main() -> anyhow::Result<()> {
         {
             let parent = &args.paths[0];
             log::info!("Starting in run-aware mode, watching: {}", parent.display());
-            let _watcher =
-                piql_server::watcher::load_and_watch_runs(core.clone(), parent.clone()).await?;
+            let _watcher = piql_server::watcher::load_and_watch_runs(
+                core.clone(),
+                parent.clone(),
+                piql_server::watcher::RunModeOptions {
+                    drop_existing_run_label_column: args.runs_drop_existing_run_col,
+                },
+            )
+            .await?;
         }
 
         #[cfg(not(feature = "file-watcher"))]

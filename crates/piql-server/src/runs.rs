@@ -56,6 +56,8 @@ pub struct RunRegistry {
     runs: Vec<RunInfo>,
     /// Name of the most recently loaded run
     latest: Option<String>,
+    /// Cached `_all::{table}` dataframes for incremental updates.
+    all_tables: HashMap<String, DataFrame>,
     options: RunRegistryOptions,
 }
 
@@ -74,6 +76,7 @@ impl RunRegistry {
         Self {
             runs: Vec::new(),
             latest: None,
+            all_tables: HashMap::new(),
             options,
         }
     }
@@ -98,6 +101,7 @@ impl RunRegistry {
         let known_tables_before = self.all_table_names();
         let mut normalized_tables: HashMap<String, DataFrame> = HashMap::new();
         let mut annotated = HashMap::new();
+        let mut incremental_all_updates = Vec::new();
 
         for (table, df) in tables {
             let normalized = self.normalize_run_table(run_name, &table, df)?;
@@ -129,6 +133,7 @@ impl RunRegistry {
                     );
                     df.clone()
                 });
+            incremental_all_updates.push((table.clone(), with_run.clone()));
             annotated.insert(table.clone(), with_run);
         }
 
@@ -138,10 +143,10 @@ impl RunRegistry {
         });
         self.latest = Some(run_name.to_string());
 
-        // 4. Rebuild _all:: for each table in this run
+        // 4. Incrementally update _all:: for each table in this run
         let table_names: Vec<String> = normalized_tables.keys().cloned().collect();
-        for table in &table_names {
-            self.rebuild_all(table, core).await;
+        for (table, with_run) in incremental_all_updates {
+            self.append_to_all(&table, with_run, core).await;
         }
         self.rebuild_latest_bare_names(core, known_tables_before)
             .await;
@@ -193,8 +198,39 @@ impl RunRegistry {
         );
     }
 
+    /// Incrementally append one run's annotated table into `_all::{table}`.
+    async fn append_to_all(&mut self, table: &str, with_run: DataFrame, core: &ServerCore) {
+        let combined = if let Some(existing) = self.all_tables.get(table) {
+            let lazy = [existing.clone().lazy(), with_run.lazy()];
+            match concat(
+                lazy,
+                UnionArgs {
+                    rechunk: false,
+                    ..Default::default()
+                },
+            )
+            .and_then(|lf| lf.collect())
+            {
+                Ok(df) => df,
+                Err(e) => {
+                    log::error!("Failed to incrementally update _all::{table}: {e}");
+                    return;
+                }
+            }
+        } else {
+            with_run
+        };
+
+        self.all_tables.insert(table.to_string(), combined.clone());
+        core.apply_update(DfUpdate::Reload {
+            name: format!("_all::{table}"),
+            df: combined,
+        })
+        .await;
+    }
+
     /// Rebuild `_all::{table}` by concatenating all runs' annotated versions.
-    async fn rebuild_all(&self, table: &str, core: &ServerCore) {
+    async fn rebuild_all(&mut self, table: &str, core: &ServerCore) {
         let all_name = format!("_all::{table}");
 
         let frames: Vec<DataFrame> = self
@@ -204,6 +240,7 @@ impl RunRegistry {
             .collect();
 
         if frames.is_empty() {
+            self.all_tables.remove(table);
             core.apply_update(DfUpdate::Remove { name: all_name }).await;
             return;
         }
@@ -229,6 +266,7 @@ impl RunRegistry {
             }
         };
 
+        self.all_tables.insert(table.to_string(), combined.clone());
         core.apply_update(DfUpdate::Reload {
             name: all_name,
             df: combined,
@@ -277,11 +315,7 @@ impl RunRegistry {
     }
 
     fn all_table_names(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        for run in &self.runs {
-            seen.extend(run.tables.keys().cloned());
-        }
-        seen.into_iter().collect()
+        self.all_tables.keys().cloned().collect()
     }
 
     fn all_table_names_with(&self, extra: &HashMap<String, DataFrame>) -> Vec<String> {
@@ -396,5 +430,24 @@ mod tests {
         let combined = core.execute_query("_all::a").await.unwrap();
         let run_col = combined.column("_run").unwrap().str().unwrap();
         assert_eq!(run_col.get(0), Some("r1"));
+    }
+
+    #[tokio::test]
+    async fn incremental_all_cache_is_updated_on_each_load() {
+        let core = ServerCore::new();
+        let mut registry = RunRegistry::new();
+
+        let mut r1 = HashMap::new();
+        r1.insert("a".to_string(), df! { "x" => &[1] }.unwrap());
+        registry.load_run("r1", r1, &core).await.unwrap();
+
+        assert!(registry.all_tables.contains_key("a"));
+        assert_eq!(registry.all_tables["a"].height(), 1);
+
+        let mut r2 = HashMap::new();
+        r2.insert("a".to_string(), df! { "x" => &[2] }.unwrap());
+        registry.load_run("r2", r2, &core).await.unwrap();
+
+        assert_eq!(registry.all_tables["a"].height(), 2);
     }
 }

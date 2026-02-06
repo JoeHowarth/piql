@@ -363,8 +363,12 @@ fn eval_pl_function(name: &str, args: &[CoreArg], ctx: &EvalContext) -> Result<V
                 Ok(Value::Expr(col(&col_names[0])))
             } else {
                 // cols() returns Selector in polars 0.52+
-                let names: Arc<[PlSmallStr]> = col_names.into_iter().map(PlSmallStr::from).collect();
-                let selector = Selector::ByName { names, strict: true };
+                let names: Arc<[PlSmallStr]> =
+                    col_names.into_iter().map(PlSmallStr::from).collect();
+                let selector = Selector::ByName {
+                    names,
+                    strict: true,
+                };
                 Ok(Value::Expr(polars::prelude::Expr::Selector(selector)))
             }
         }
@@ -427,13 +431,19 @@ fn eval_df_method(
         "drop" => {
             let col_names = collect_string_args(args)?;
             let names: Arc<[PlSmallStr]> = col_names.into_iter().map(PlSmallStr::from).collect();
-            let selector = Selector::ByName { names, strict: true };
+            let selector = Selector::ByName {
+                names,
+                strict: true,
+            };
             Ok(Value::DataFrame(df.drop(selector), source))
         }
         "explode" => {
             let col_names = collect_string_args(args)?;
             let names: Arc<[PlSmallStr]> = col_names.into_iter().map(PlSmallStr::from).collect();
-            let selector = Selector::ByName { names, strict: true };
+            let selector = Selector::ByName {
+                names,
+                strict: true,
+            };
             Ok(Value::DataFrame(df.explode(selector), source))
         }
         "drop_nulls" => Ok(Value::DataFrame(df.drop_nulls(None), source)),
@@ -444,10 +454,17 @@ fn eval_df_method(
                 None
             } else {
                 let col_names = get_strings_arg(args, 0, "unique")?;
-                let names: Arc<[PlSmallStr]> = col_names.into_iter().map(PlSmallStr::from).collect();
-                Some(Selector::ByName { names, strict: true })
+                let names: Arc<[PlSmallStr]> =
+                    col_names.into_iter().map(PlSmallStr::from).collect();
+                Some(Selector::ByName {
+                    names,
+                    strict: true,
+                })
             };
-            Ok(Value::DataFrame(df.unique(subset, UniqueKeepStrategy::Any), source))
+            Ok(Value::DataFrame(
+                df.unique(subset, UniqueKeepStrategy::Any),
+                source,
+            ))
         }
         "count" => {
             // Returns non-null count per column (like pandas df.count())
@@ -514,20 +531,7 @@ fn eval_df_method(
                 .tick
                 .ok_or_else(|| EvalError::Other(".window() requires tick in context".into()))?;
 
-            // Get the right df and tick column
-            let (target_df, tick_col) = if let Some(ref name) = source {
-                if let Some(entry) = ctx.base_tables.get(name) {
-                    if let Some(ref all_df) = entry.all {
-                        (all_df.clone(), entry.config.tick_column.as_str())
-                    } else {
-                        (df, "tick")
-                    }
-                } else {
-                    (df, "tick")
-                }
-            } else {
-                (df, "tick")
-            };
+            let (target_df, tick_col) = resolve_scope_target(df, source.as_deref(), ctx);
 
             let filtered = target_df.filter(col(tick_col).is_between(
                 lit(tick + a),
@@ -540,19 +544,7 @@ fn eval_df_method(
             // For base tables, swap to `all` ptr then filter
             let n = get_int_arg(args, 0, "since")?;
 
-            let (target_df, tick_col) = if let Some(ref name) = source {
-                if let Some(entry) = ctx.base_tables.get(name) {
-                    if let Some(ref all_df) = entry.all {
-                        (all_df.clone(), entry.config.tick_column.as_str())
-                    } else {
-                        (df, "tick")
-                    }
-                } else {
-                    (df, "tick")
-                }
-            } else {
-                (df, "tick")
-            };
+            let (target_df, tick_col) = resolve_scope_target(df, source.as_deref(), ctx);
 
             let filtered = target_df.filter(col(tick_col).gt_eq(lit(n)));
             Ok(Value::DataFrame(filtered, None))
@@ -561,19 +553,7 @@ fn eval_df_method(
             // For base tables, swap to `all` ptr then filter
             let n = get_int_arg(args, 0, "at")?;
 
-            let (target_df, tick_col) = if let Some(ref name) = source {
-                if let Some(entry) = ctx.base_tables.get(name) {
-                    if let Some(ref all_df) = entry.all {
-                        (all_df.clone(), entry.config.tick_column.as_str())
-                    } else {
-                        (df, "tick")
-                    }
-                } else {
-                    (df, "tick")
-                }
-            } else {
-                (df, "tick")
-            };
+            let (target_df, tick_col) = resolve_scope_target(df, source.as_deref(), ctx);
 
             let filtered = target_df.filter(col(tick_col).eq(lit(n)));
             Ok(Value::DataFrame(filtered, None))
@@ -691,6 +671,21 @@ fn eval_df_method(
             method: method.to_string(),
         }),
     }
+}
+
+fn resolve_scope_target(
+    df: LazyFrame,
+    source: Option<&str>,
+    ctx: &EvalContext,
+) -> (LazyFrame, String) {
+    if let Some(name) = source
+        && let Some(entry) = ctx.base_tables.get(name)
+        && let Some(all_df) = entry.all.clone()
+    {
+        return (all_df, entry.config.tick_column.clone());
+    }
+
+    (df, "tick".to_string())
 }
 
 fn eval_groupby_method(
@@ -1018,9 +1013,8 @@ fn try_extract_col_name(expr: &Expr) -> Option<String> {
 
 fn get_string_arg(args: &[CoreArg], idx: usize, fn_name: &str) -> Result<String> {
     let expr = get_positional_arg(args, idx, fn_name)?;
-    try_extract_col_name(expr).ok_or_else(|| {
-        EvalError::ArgError(format!("{fn_name}() argument {idx} must be a string"))
-    })
+    try_extract_col_name(expr)
+        .ok_or_else(|| EvalError::ArgError(format!("{fn_name}() argument {idx} must be a string")))
 }
 
 /// Get a positional arg that can be either a single string/col or a list of strings/cols

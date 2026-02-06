@@ -39,6 +39,9 @@ pub enum Expr {
         /// The else value
         otherwise: Box<Expr>,
     },
+
+    /// Invalid expression produced by transform (converted to EvalError at runtime)
+    Invalid(String),
 }
 
 impl Expr {

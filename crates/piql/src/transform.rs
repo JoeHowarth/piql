@@ -63,7 +63,7 @@ fn transform_expr(expr: SurfaceExpr, registry: &SugarRegistry, ctx: &SugarContex
                 .collect();
             registry
                 .expand_directive(&name, &core_args, ctx)
-                .unwrap_or_else(|| panic!("Unknown directive: @{name}"))
+                .unwrap_or_else(|| CoreExpr::Invalid(format!("Unknown directive: @{name}")))
         }
         SurfaceExpr::Call(callee, args) => {
             // Check for .otherwise() pattern - signals end of when chain
@@ -207,7 +207,7 @@ fn build_when_then_otherwise(
     registry: &SugarRegistry,
     ctx: &SugarContext,
 ) -> CoreExpr {
-    let otherwise_value = otherwise_args
+    let Some(otherwise_value) = otherwise_args
         .into_iter()
         .find_map(|arg| {
             if let Arg::Positional(e) = arg {
@@ -216,7 +216,9 @@ fn build_when_then_otherwise(
                 None
             }
         })
-        .expect("otherwise() requires an argument");
+    else {
+        return CoreExpr::Invalid("otherwise() requires an argument".to_string());
+    };
 
     let branches = chain
         .into_iter()

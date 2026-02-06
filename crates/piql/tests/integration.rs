@@ -1312,6 +1312,30 @@ fn custom_directive_entity_with_arg() {
 }
 
 #[test]
+fn unknown_directive_returns_error() {
+    let ctx = setup_test_df();
+    match run(r#"entities.filter(@missing)"#, &ctx) {
+        Ok(_) => panic!("expected unknown directive error"),
+        Err(err) => assert!(
+            err.to_string().contains("Unknown directive: @missing"),
+            "unexpected error: {err}"
+        ),
+    }
+}
+
+#[test]
+fn otherwise_without_arg_returns_error() {
+    let ctx = setup_test_df();
+    match run(r#"entities.with_columns(pl.when(True).then(1).otherwise())"#, &ctx) {
+        Ok(_) => panic!("expected otherwise() argument error"),
+        Err(err) => assert!(
+            err.to_string().contains("otherwise() requires an argument"),
+            "unexpected error: {err}"
+        ),
+    }
+}
+
+#[test]
 fn time_series_df_with_config() {
     let df = df! {
         "entity_id" => &[1, 1, 1, 2, 2, 2],

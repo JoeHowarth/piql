@@ -241,6 +241,7 @@ pub fn eval(expr: &Expr, ctx: &EvalContext) -> Result<Value> {
             branches,
             otherwise,
         } => eval_when_then_otherwise(branches, otherwise, ctx),
+        Expr::Invalid(message) => Err(EvalError::Other(message.clone())),
     }
 }
 
@@ -633,7 +634,7 @@ fn eval_df_method(
 
             // Reorder columns to put statistic first
             let mut col_order: Vec<polars::prelude::Expr> = vec![col("statistic")];
-            col_order.extend(numeric_cols.iter().map(|c| col(c)));
+            col_order.extend(numeric_cols.iter().map(col));
             let result = result.select(col_order);
 
             Ok(Value::DataFrame(result, None))

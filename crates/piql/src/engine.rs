@@ -250,6 +250,16 @@ impl QueryEngine {
         self.ctx.tick = Some(tick);
     }
 
+    /// Set default tick column for scope methods when table config is unavailable.
+    pub fn set_default_tick_column(&mut self, tick_column: impl Into<String>) {
+        self.ctx.default_tick_column = Some(tick_column.into());
+    }
+
+    /// Set default partition key for sugar methods when table config is unavailable.
+    pub fn set_default_partition_key(&mut self, partition_key: impl Into<String>) {
+        self.ctx.default_partition_key = Some(partition_key.into());
+    }
+
     /// Get names of all registered dataframes
     pub fn dataframe_names(&self) -> Vec<String> {
         self.ctx.dataframes.keys().cloned().collect()

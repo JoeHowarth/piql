@@ -95,6 +95,10 @@ pub struct EvalContext {
     pub base_tables: HashMap<String, BaseTableEntry>,
     /// Current simulation tick (for @now, .window, etc.)
     pub tick: Option<i64>,
+    /// Default tick column for scope methods when source table config is unavailable
+    pub default_tick_column: Option<String>,
+    /// Default partition key for sugar methods when source table config is unavailable
+    pub default_partition_key: Option<String>,
     /// Sugar registry for directive expansion
     pub sugar: crate::sugar::SugarRegistry,
 }
@@ -105,6 +109,8 @@ impl EvalContext {
             dataframes: HashMap::new(),
             base_tables: HashMap::new(),
             tick: None,
+            default_tick_column: None,
+            default_partition_key: None,
             sugar: crate::sugar::SugarRegistry::new(),
         }
     }
@@ -158,6 +164,18 @@ impl EvalContext {
         self
     }
 
+    /// Set default tick column used by scope methods when table config is unavailable
+    pub fn with_default_tick_column(mut self, tick_column: impl Into<String>) -> Self {
+        self.default_tick_column = Some(tick_column.into());
+        self
+    }
+
+    /// Set default partition key used by sugar methods when table config is unavailable
+    pub fn with_default_partition_key(mut self, partition_key: impl Into<String>) -> Self {
+        self.default_partition_key = Some(partition_key.into());
+        self
+    }
+
     /// Get time-series config for a dataframe (if registered as time-series)
     pub fn get_time_series_config(&self, name: &str) -> Option<&TimeSeriesConfig> {
         self.dataframes
@@ -169,7 +187,8 @@ impl EvalContext {
     pub fn sugar_context(&self, df_name: Option<&str>) -> crate::sugar::SugarContext {
         let partition_key = df_name
             .and_then(|name| self.get_time_series_config(name))
-            .map(|ts| ts.partition_key.clone());
+            .map(|ts| ts.partition_key.clone())
+            .or_else(|| self.default_partition_key.clone());
 
         crate::sugar::SugarContext {
             tick: self.tick,
@@ -255,7 +274,10 @@ fn eval_ident(name: &str, ctx: &EvalContext) -> Result<Value> {
             }
             // Otherwise check regular dataframes
             if let Some(entry) = ctx.dataframes.get(name) {
-                Ok(Value::DataFrame(entry.df.clone().lazy(), None))
+                Ok(Value::DataFrame(
+                    entry.df.clone().lazy(),
+                    Some(name.to_string()),
+                ))
             } else {
                 Err(EvalError::UnknownIdent(name.to_string()))
             }
@@ -342,10 +364,13 @@ fn eval_method_call(
     }
 
     let base_val = eval(base_expr, ctx)?;
+    let base_is_direct_ident = matches!(base_expr, Expr::Ident(_));
 
     match base_val {
         Value::PlNamespace => eval_pl_function(method, args, ctx),
-        Value::DataFrame(df, source) => eval_df_method(df, source, method, args, ctx),
+        Value::DataFrame(df, source) => {
+            eval_df_method(df, source, method, args, ctx, base_is_direct_ident)
+        }
         Value::GroupBy(gb) => eval_groupby_method(gb, method, args, ctx),
         Value::Expr(e) => eval_expr_method(e, method, args, ctx),
         Value::Scalar(_) => Err(EvalError::TypeError {
@@ -399,6 +424,7 @@ fn eval_df_method(
     method: &str,
     args: &[CoreArg],
     ctx: &EvalContext,
+    base_is_direct_ident: bool,
 ) -> Result<Value> {
     match method {
         "filter" => {
@@ -408,7 +434,7 @@ fn eval_df_method(
         }
         "select" => {
             let exprs = collect_expr_args(args, ctx)?;
-            Ok(Value::DataFrame(df.select(exprs), None)) // select changes shape, clear source
+            Ok(Value::DataFrame(df.select(exprs), source))
         }
         "with_columns" => {
             let exprs = collect_expr_args(args, ctx)?;
@@ -473,13 +499,13 @@ fn eval_df_method(
                 .iter()
                 .map(|(name, _)| col(name.as_str()).count().alias(name.as_str()))
                 .collect();
-            Ok(Value::DataFrame(df.select(count_exprs), None))
+            Ok(Value::DataFrame(df.select(count_exprs), source))
         }
         "height" => {
             // Returns single-row DataFrame with row count
             Ok(Value::DataFrame(
                 df.select([polars::prelude::len().alias("height")]),
-                None,
+                source,
             ))
         }
         "group_by" => {
@@ -515,48 +541,49 @@ fn eval_df_method(
         }
         // Scope methods for time-series data
         "all" => {
-            // For base tables, swap to `all` ptr; for others, return as-is
-            if let Some(ref name) = source
+            // For direct base-table access, swap to `all` ptr; otherwise keep current df.
+            if base_is_direct_ident
+                && let Some(ref name) = source
                 && let Some(all_df) = ctx.get_base_all(name)
             {
-                return Ok(Value::DataFrame(all_df, None)); // scope resolved, clear source
+                return Ok(Value::DataFrame(all_df, source));
             }
-            Ok(Value::DataFrame(df, None))
+            Ok(Value::DataFrame(df, source))
         }
         "window" => {
-            // For base tables, swap to `all` ptr then filter
+            // For direct base-table access, scope against `all`; otherwise scope current df.
             let a = get_int_arg(args, 0, "window")?;
             let b = get_int_arg(args, 1, "window")?;
             let tick = ctx
                 .tick
                 .ok_or_else(|| EvalError::Other(".window() requires tick in context".into()))?;
+            let tick_col = resolve_scope_tick_column(source.as_deref(), ctx, "window")?;
+            let target_df = scope_target_df(df, source.as_deref(), ctx, base_is_direct_ident);
 
-            let (target_df, tick_col) = resolve_scope_target(df, source.as_deref(), ctx);
-
-            let filtered = target_df.filter(col(tick_col).is_between(
+            let filtered = target_df.filter(col(&tick_col).is_between(
                 lit(tick + a),
                 lit(tick + b),
                 ClosedInterval::Both,
             ));
-            Ok(Value::DataFrame(filtered, None)) // scope resolved
+            Ok(Value::DataFrame(filtered, source))
         }
         "since" => {
-            // For base tables, swap to `all` ptr then filter
+            // For direct base-table access, scope against `all`; otherwise scope current df.
             let n = get_int_arg(args, 0, "since")?;
+            let tick_col = resolve_scope_tick_column(source.as_deref(), ctx, "since")?;
+            let target_df = scope_target_df(df, source.as_deref(), ctx, base_is_direct_ident);
 
-            let (target_df, tick_col) = resolve_scope_target(df, source.as_deref(), ctx);
-
-            let filtered = target_df.filter(col(tick_col).gt_eq(lit(n)));
-            Ok(Value::DataFrame(filtered, None))
+            let filtered = target_df.filter(col(&tick_col).gt_eq(lit(n)));
+            Ok(Value::DataFrame(filtered, source))
         }
         "at" => {
-            // For base tables, swap to `all` ptr then filter
+            // For direct base-table access, scope against `all`; otherwise scope current df.
             let n = get_int_arg(args, 0, "at")?;
+            let tick_col = resolve_scope_tick_column(source.as_deref(), ctx, "at")?;
+            let target_df = scope_target_df(df, source.as_deref(), ctx, base_is_direct_ident);
 
-            let (target_df, tick_col) = resolve_scope_target(df, source.as_deref(), ctx);
-
-            let filtered = target_df.filter(col(tick_col).eq(lit(n)));
-            Ok(Value::DataFrame(filtered, None))
+            let filtered = target_df.filter(col(&tick_col).eq(lit(n)));
+            Ok(Value::DataFrame(filtered, source))
         }
         // Convenience method
         "top" => {
@@ -617,7 +644,7 @@ fn eval_df_method(
             col_order.extend(numeric_cols.iter().map(col));
             let result = result.select(col_order);
 
-            Ok(Value::DataFrame(result, None))
+            Ok(Value::DataFrame(result, source))
         }
         "join" => {
             // Get the other dataframe (first positional arg)
@@ -664,7 +691,7 @@ fn eval_df_method(
                 df.join(other, left_exprs, right_exprs, JoinArgs::new(join_type))
             };
 
-            Ok(Value::DataFrame(result, None)) // join clears source
+            Ok(Value::DataFrame(result, None)) // join merges two sources; clear lineage
         }
         _ => Err(EvalError::UnknownMethod {
             target: "DataFrame".to_string(),
@@ -673,19 +700,45 @@ fn eval_df_method(
     }
 }
 
-fn resolve_scope_target(
+fn scope_target_df(
     df: LazyFrame,
     source: Option<&str>,
     ctx: &EvalContext,
-) -> (LazyFrame, String) {
-    if let Some(name) = source
+    base_is_direct_ident: bool,
+) -> LazyFrame {
+    if base_is_direct_ident
+        && let Some(name) = source
         && let Some(entry) = ctx.base_tables.get(name)
         && let Some(all_df) = entry.all.clone()
     {
-        return (all_df, entry.config.tick_column.clone());
+        return all_df;
     }
 
-    (df, "tick".to_string())
+    df
+}
+
+fn resolve_scope_tick_column(
+    source: Option<&str>,
+    ctx: &EvalContext,
+    method: &str,
+) -> Result<String> {
+    if let Some(name) = source {
+        if let Some(entry) = ctx.base_tables.get(name) {
+            return Ok(entry.config.tick_column.clone());
+        }
+
+        if let Some(cfg) = ctx.get_time_series_config(name) {
+            return Ok(cfg.tick_column.clone());
+        }
+    }
+
+    if let Some(default_tick) = &ctx.default_tick_column {
+        return Ok(default_tick.clone());
+    }
+
+    Err(EvalError::Other(format!(
+        ".{method}() requires tick column configuration; register a time-series dataframe or set EvalContext::with_default_tick_column(...)"
+    )))
 }
 
 fn eval_groupby_method(

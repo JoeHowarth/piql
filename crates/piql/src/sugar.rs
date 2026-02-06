@@ -105,38 +105,48 @@ impl SugarRegistry {
 
     /// Register built-in $col.method handlers
     fn register_builtin_col_methods(&mut self) {
-        // $col.delta -> col.diff().over(partition)
-        // $col.delta(n) -> col - col.shift(n).over(partition)
+        // $col.delta -> col.diff() [optionally partitioned with .over(partition)]
+        // $col.delta(n) -> col - col.shift(n) [optionally partitioned]
         self.register_col_method("delta", |col_expr, args, ctx| {
-            let partition = ctx.partition_key.as_deref().unwrap_or("entity_id");
-
-            if args.is_empty() {
-                // $col.delta -> col.diff().over(partition)
-                helpers::method_call(
-                    helpers::method_call(col_expr, "diff", vec![]),
-                    "over",
-                    vec![Arg::pos(helpers::lit_str(partition))],
-                )
+            if let Some(partition) = ctx.partition_key.as_deref() {
+                if args.is_empty() {
+                    // Partitioned: col.diff().over(partition)
+                    helpers::method_call(
+                        helpers::method_call(col_expr, "diff", vec![]),
+                        "over",
+                        vec![Arg::pos(helpers::lit_str(partition))],
+                    )
+                } else {
+                    // Partitioned: col - col.shift(n).over(partition)
+                    let shifted = helpers::method_call(
+                        helpers::method_call(col_expr.clone(), "shift", args.to_vec()),
+                        "over",
+                        vec![Arg::pos(helpers::lit_str(partition))],
+                    );
+                    helpers::binop(col_expr, BinOp::Sub, shifted)
+                }
+            } else if args.is_empty() {
+                // Unpartitioned: col.diff()
+                helpers::method_call(col_expr, "diff", vec![])
             } else {
-                // $col.delta(n) -> col - col.shift(n).over(partition)
-                let shifted = helpers::method_call(
-                    helpers::method_call(col_expr.clone(), "shift", args.to_vec()),
-                    "over",
-                    vec![Arg::pos(helpers::lit_str(partition))],
-                );
+                // Unpartitioned: col - col.shift(n)
+                let shifted = helpers::method_call(col_expr.clone(), "shift", args.to_vec());
                 helpers::binop(col_expr, BinOp::Sub, shifted)
             }
         });
 
-        // $col.pct(n) -> (col - col.shift(n)) / col.shift(n), all over partition
+        // $col.pct(n) -> (col - col.shift(n)) / col.shift(n) [optionally partitioned]
         self.register_col_method("pct", |col_expr, args, ctx| {
-            let partition = ctx.partition_key.as_deref().unwrap_or("entity_id");
-
-            let shifted = helpers::method_call(
-                helpers::method_call(col_expr.clone(), "shift", args.to_vec()),
-                "over",
-                vec![Arg::pos(helpers::lit_str(partition))],
-            );
+            let shifted_base = helpers::method_call(col_expr.clone(), "shift", args.to_vec());
+            let shifted = if let Some(partition) = ctx.partition_key.as_deref() {
+                helpers::method_call(
+                    shifted_base,
+                    "over",
+                    vec![Arg::pos(helpers::lit_str(partition))],
+                )
+            } else {
+                shifted_base
+            };
             let diff = helpers::binop(col_expr, BinOp::Sub, shifted.clone());
             helpers::binop(diff, BinOp::Div, shifted)
         });

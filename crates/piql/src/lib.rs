@@ -67,10 +67,30 @@ pub use eval::{DataFrameEntry, EvalContext, TimeSeriesConfig, Value};
 /// Run a one-off query
 pub fn run(query: &str, ctx: &EvalContext) -> Result<Value, PiqlError> {
     let surface = parse::parse(query)?;
-    let sugar_ctx = ctx.sugar_context(None);
+    let root_df = infer_root_dataframe_name(&surface);
+    let sugar_ctx = ctx.sugar_context(root_df);
     let core = transform::transform_with_sugar(surface, &ctx.sugar, &sugar_ctx);
     let result = eval::eval(&core, ctx)?;
     Ok(result)
+}
+
+fn infer_root_dataframe_name(expr: &ast::surface::Expr) -> Option<&str> {
+    use ast::surface::Expr as SurfaceExpr;
+
+    match expr {
+        SurfaceExpr::Ident(name) if name != "pl" => Some(name.as_str()),
+        SurfaceExpr::Ident(_) => None,
+        SurfaceExpr::Attr(base, _) => infer_root_dataframe_name(base),
+        SurfaceExpr::Call(callee, _) => infer_root_dataframe_name(callee),
+        SurfaceExpr::BinaryOp(lhs, _, rhs) => {
+            infer_root_dataframe_name(lhs).or_else(|| infer_root_dataframe_name(rhs))
+        }
+        SurfaceExpr::UnaryOp(_, inner) => infer_root_dataframe_name(inner),
+        SurfaceExpr::List(items) => items.iter().find_map(infer_root_dataframe_name),
+        SurfaceExpr::Literal(_) | SurfaceExpr::ColShorthand(_) | SurfaceExpr::Directive(_, _) => {
+            None
+        }
+    }
 }
 
 // ============ Errors ============

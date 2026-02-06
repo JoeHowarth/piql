@@ -1172,7 +1172,9 @@ fn sugar_col_delta() {
     .unwrap()
     .lazy();
 
-    let ctx = EvalContext::new().with_df("entities", df);
+    let ctx = EvalContext::new()
+        .with_df("entities", df)
+        .with_default_partition_key("entity_id");
     let result = run_to_df(
         r#"entities.with_columns($gold.delta.alias("gold_change"))"#,
         &ctx,
@@ -1187,6 +1189,30 @@ fn sugar_col_delta() {
     assert_eq!(changes.get(4).unwrap(), 50); // 250 - 200
 }
 
+#[test]
+fn sugar_col_delta_without_partition_is_unpartitioned() {
+    let df = df! {
+        "entity_id" => &[1, 1, 1, 2, 2],
+        "tick" => &[1, 2, 3, 1, 2],
+        "gold" => &[100, 150, 120, 200, 250],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("entities", df);
+    let result = run_to_df(
+        r#"entities.with_columns($gold.delta.alias("gold_change"))"#,
+        &ctx,
+    );
+
+    let changes = result.column("gold_change").unwrap().i32().unwrap();
+    assert!(changes.get(0).is_none());
+    assert_eq!(changes.get(1).unwrap(), 50);
+    assert_eq!(changes.get(2).unwrap(), -30);
+    assert_eq!(changes.get(3).unwrap(), 80);
+    assert_eq!(changes.get(4).unwrap(), 50);
+}
+
 // ============ Scope Methods ============
 
 #[test]
@@ -1198,7 +1224,10 @@ fn scope_window() {
     .unwrap()
     .lazy();
 
-    let ctx = EvalContext::new().with_df("data", df).with_tick(100);
+    let ctx = EvalContext::new()
+        .with_df("data", df)
+        .with_default_tick_column("tick")
+        .with_tick(100);
     // window(-3, 0) should get ticks 97-100
     let result = run_to_df(r#"data.window(-3, 0)"#, &ctx);
     assert_eq!(result.height(), 4);
@@ -1213,7 +1242,9 @@ fn scope_since() {
     .unwrap()
     .lazy();
 
-    let ctx = EvalContext::new().with_df("data", df);
+    let ctx = EvalContext::new()
+        .with_df("data", df)
+        .with_default_tick_column("tick");
     // since(3) should get ticks >= 3
     let result = run_to_df(r#"data.since(3)"#, &ctx);
     assert_eq!(result.height(), 3);
@@ -1228,7 +1259,9 @@ fn scope_at() {
     .unwrap()
     .lazy();
 
-    let ctx = EvalContext::new().with_df("data", df);
+    let ctx = EvalContext::new()
+        .with_df("data", df)
+        .with_default_tick_column("tick");
     // at(3) should get only tick == 3
     let result = run_to_df(r#"data.at(3)"#, &ctx);
     assert_eq!(result.height(), 1);
@@ -1257,6 +1290,26 @@ fn scope_all() {
     // all() should return all rows
     let result = run_to_df(r#"data.all()"#, &ctx);
     assert_eq!(result.height(), 5);
+}
+
+#[test]
+fn scope_at_without_tick_config_errors() {
+    let df = df! {
+        "tick" => &[1, 2, 3],
+        "value" => &[10, 20, 30],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_df("data", df);
+    match run(r#"data.at(2)"#, &ctx) {
+        Ok(_) => panic!("expected missing tick-column configuration error"),
+        Err(err) => assert!(
+            err.to_string()
+                .contains("requires tick column configuration"),
+            "unexpected error: {err}"
+        ),
+    }
 }
 
 #[test]
@@ -1375,6 +1428,61 @@ fn time_series_df_with_config() {
     assert_eq!(result.height(), 4);
 }
 
+#[test]
+fn time_series_df_custom_tick_column() {
+    let df = df! {
+        "entity_id" => &[1, 1, 2, 2],
+        "step" => &[1, 2, 1, 2],
+        "gold" => &[100, 120, 200, 250],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_time_series_df(
+        "entities",
+        df,
+        TimeSeriesConfig {
+            tick_column: "step".into(),
+            partition_key: "entity_id".into(),
+        },
+    );
+
+    let result = run_to_df(r#"entities.at(2)"#, &ctx);
+    assert_eq!(result.height(), 2);
+}
+
+#[test]
+fn run_infers_root_df_for_partition_sugar() {
+    let df = df! {
+        "account_id" => &[1, 1, 1, 2, 2],
+        "step" => &[1, 2, 3, 1, 2],
+        "gold" => &[100, 150, 120, 200, 250],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new().with_time_series_df(
+        "entities",
+        df,
+        TimeSeriesConfig {
+            tick_column: "step".into(),
+            partition_key: "account_id".into(),
+        },
+    );
+
+    let result = run_to_df(
+        r#"entities.with_columns($gold.delta.alias("gold_change"))"#,
+        &ctx,
+    );
+
+    let changes = result.column("gold_change").unwrap().i32().unwrap();
+    assert!(changes.get(0).is_none());
+    assert_eq!(changes.get(1).unwrap(), 50);
+    assert_eq!(changes.get(2).unwrap(), -30);
+    assert!(changes.get(3).is_none());
+    assert_eq!(changes.get(4).unwrap(), 50);
+}
+
 // ============ QueryEngine ============
 
 #[test]
@@ -1476,6 +1584,7 @@ fn query_engine_materialized_chain() {
 
     let mut engine = QueryEngine::new();
     engine.add_base_df("entities", df);
+    engine.set_default_tick_column("tick");
 
     // Chain of materialized tables
     engine

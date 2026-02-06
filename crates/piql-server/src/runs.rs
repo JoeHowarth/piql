@@ -89,7 +89,8 @@ impl RunRegistry {
         for table in &table_names {
             self.rebuild_all(table, core).await;
         }
-        self.rebuild_latest_bare_names(core, known_tables_before).await;
+        self.rebuild_latest_bare_names(core, known_tables_before)
+            .await;
 
         log::info!(
             "Loaded run '{}' with {} tables (now {} runs total)",
@@ -124,9 +125,9 @@ impl RunRegistry {
         // Rebuild _all:: and bare names for affected tables
         for table in &table_names {
             self.rebuild_all(table, core).await;
-
         }
-        self.rebuild_latest_bare_names(core, known_tables_before).await;
+        self.rebuild_latest_bare_names(core, known_tables_before)
+            .await;
 
         log::info!(
             "Removed run '{}' ({} tables, {} runs remaining)",
@@ -147,8 +148,7 @@ impl RunRegistry {
             .collect();
 
         if frames.is_empty() {
-            core.apply_update(DfUpdate::Remove { name: all_name })
-                .await;
+            core.apply_update(DfUpdate::Remove { name: all_name }).await;
             return;
         }
 
@@ -209,11 +209,8 @@ impl RunRegistry {
         for table in known_tables {
             match self.latest_df_for(&table) {
                 Some(df) => {
-                    core.apply_update(DfUpdate::Reload {
-                        name: table,
-                        df,
-                    })
-                    .await;
+                    core.apply_update(DfUpdate::Reload { name: table, df })
+                        .await;
                 }
                 None => {
                     core.apply_update(DfUpdate::Remove { name: table }).await;

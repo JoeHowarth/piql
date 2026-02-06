@@ -72,7 +72,10 @@ async fn main() -> anyhow::Result<()> {
         Some(args.max_rows)
     };
     let core = Arc::new(piql_server::ServerCore::with_max_rows(max_rows));
-    log::info!("Max rows per query: {}", max_rows.map_or("unlimited".to_string(), |n| n.to_string()));
+    log::info!(
+        "Max rows per query: {}",
+        max_rows.map_or("unlimited".to_string(), |n| n.to_string())
+    );
 
     if args.runs {
         // Run-aware mode: watch parent dir for run subdirectories

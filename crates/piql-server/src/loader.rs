@@ -12,13 +12,19 @@ pub fn load_file_sync(path: &Path) -> Result<DataFrame, PolarsError> {
     let lf = match path.extension().and_then(|e| e.to_str()) {
         Some("parquet") => LazyFrame::scan_parquet(pl_path, Default::default())?,
         Some("csv") => LazyCsvReader::new(pl_path).finish()?,
-        Some("ipc" | "arrow") => LazyFrame::scan_ipc(pl_path, Default::default(), Default::default())?,
-        Some(ext) => return Err(PolarsError::ComputeError(
-            format!("unsupported file extension: {ext}").into(),
-        )),
-        None => return Err(PolarsError::ComputeError(
-            "file has no extension".to_string().into(),
-        )),
+        Some("ipc" | "arrow") => {
+            LazyFrame::scan_ipc(pl_path, Default::default(), Default::default())?
+        }
+        Some(ext) => {
+            return Err(PolarsError::ComputeError(
+                format!("unsupported file extension: {ext}").into(),
+            ));
+        }
+        None => {
+            return Err(PolarsError::ComputeError(
+                "file has no extension".to_string().into(),
+            ));
+        }
     };
     lf.collect()
 }
@@ -103,22 +109,16 @@ fn load_concat_dir_sync(dir: &Path) -> Result<HashMap<String, DataFrame>, Polars
             continue;
         }
 
-        log::info!(
-            "Loading {} ({} files)",
-            name,
-            paths.len()
-        );
+        log::info!("Loading {} ({} files)", name, paths.len());
 
         // Load all files as DataFrames
         let frames: Vec<DataFrame> = paths
             .iter()
-            .filter_map(|p| {
-                match load_file_sync(p) {
-                    Ok(df) => Some(df),
-                    Err(e) => {
-                        log::warn!("Failed to load {}: {}", p.display(), e);
-                        None
-                    }
+            .filter_map(|p| match load_file_sync(p) {
+                Ok(df) => Some(df),
+                Err(e) => {
+                    log::warn!("Failed to load {}: {}", p.display(), e);
+                    None
                 }
             })
             .collect();

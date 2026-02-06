@@ -10,7 +10,9 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use crate::core::ServerCore;
-use crate::loader::{df_name_from_path, is_supported_file, load_file, load_file_sync, collect_files};
+use crate::loader::{
+    collect_files, df_name_from_path, is_supported_file, load_file, load_file_sync,
+};
 use crate::runs::RunRegistry;
 use crate::state::DfUpdate;
 
@@ -120,7 +122,6 @@ pub struct RunWatcher {
     _watcher: RecommendedWatcher,
 }
 
-
 /// Load all parquet files from a run directory into the registry.
 async fn load_run_dir(
     registry: &mut RunRegistry,
@@ -173,9 +174,7 @@ pub async fn load_and_watch_runs(
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|entry| {
-            entry.path().is_dir() && entry.path().join("_ready").exists()
-        })
+        .filter(|entry| entry.path().is_dir() && entry.path().join("_ready").exists())
         .collect();
 
     // Sort by name (timestamp prefix → chronological order)

@@ -50,6 +50,7 @@ impl RunRegistry {
             return;
         }
 
+        let known_tables_before = self.all_table_names();
         let mut annotated = HashMap::new();
 
         for (table, df) in &tables {
@@ -88,6 +89,7 @@ impl RunRegistry {
         for table in &table_names {
             self.rebuild_all(table, core).await;
         }
+        self.rebuild_latest_bare_names(core, known_tables_before).await;
 
         log::info!(
             "Loaded run '{}' with {} tables (now {} runs total)",
@@ -116,35 +118,15 @@ impl RunRegistry {
             .await;
         }
 
-        // Update latest if we removed the current latest
-        let was_latest = self.latest.as_deref() == Some(run_name);
-        if was_latest {
-            self.latest = self.runs.last().map(|r| r.name.clone());
-        }
+        let known_tables_before = self.all_table_names_with(&removed.tables);
+        self.latest = self.runs.last().map(|r| r.name.clone());
 
         // Rebuild _all:: and bare names for affected tables
         for table in &table_names {
             self.rebuild_all(table, core).await;
 
-            if was_latest {
-                // Update bare name to new latest (or remove if no runs left)
-                match self.latest_df_for(table) {
-                    Some(df) => {
-                        core.apply_update(DfUpdate::Reload {
-                            name: table.clone(),
-                            df,
-                        })
-                        .await;
-                    }
-                    None => {
-                        core.apply_update(DfUpdate::Remove {
-                            name: table.clone(),
-                        })
-                        .await;
-                    }
-                }
-            }
         }
+        self.rebuild_latest_bare_names(core, known_tables_before).await;
 
         log::info!(
             "Removed run '{}' ({} tables, {} runs remaining)",
@@ -205,5 +187,88 @@ impl RunRegistry {
         let annotated = run.tables.get(table)?;
         // Strip the _run column to get the bare version
         Some(annotated.drop("_run").unwrap_or_else(|_| annotated.clone()))
+    }
+
+    fn all_table_names(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        for run in &self.runs {
+            seen.extend(run.tables.keys().cloned());
+        }
+        seen.into_iter().collect()
+    }
+
+    fn all_table_names_with(&self, extra: &HashMap<String, DataFrame>) -> Vec<String> {
+        let mut names = self.all_table_names();
+        names.extend(extra.keys().cloned());
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    async fn rebuild_latest_bare_names(&self, core: &ServerCore, known_tables: Vec<String>) {
+        for table in known_tables {
+            match self.latest_df_for(&table) {
+                Some(df) => {
+                    core.apply_update(DfUpdate::Reload {
+                        name: table,
+                        df,
+                    })
+                    .await;
+                }
+                None => {
+                    core.apply_update(DfUpdate::Remove { name: table }).await;
+                }
+            }
+        }
+    }
+}
+
+impl Default for RunRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use polars::df;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn latest_bare_names_are_rebuilt_on_new_run() {
+        let core = ServerCore::new();
+        let mut registry = RunRegistry::new();
+
+        let mut r1 = HashMap::new();
+        r1.insert("a".to_string(), df! { "x" => &[1] }.unwrap());
+        registry.load_run("r1", r1, &core).await;
+
+        let mut r2 = HashMap::new();
+        r2.insert("b".to_string(), df! { "y" => &[2] }.unwrap());
+        registry.load_run("r2", r2, &core).await;
+
+        let names: HashSet<_> = core.list_dataframes().await.into_iter().collect();
+        assert!(names.contains("b"));
+        assert!(!names.contains("a"));
+    }
+
+    #[tokio::test]
+    async fn removing_old_run_cleans_stale_bare_names() {
+        let core = ServerCore::new();
+        let mut registry = RunRegistry::new();
+
+        let mut r1 = HashMap::new();
+        r1.insert("a".to_string(), df! { "x" => &[1] }.unwrap());
+        registry.load_run("r1", r1, &core).await;
+
+        let mut r2 = HashMap::new();
+        r2.insert("b".to_string(), df! { "y" => &[2] }.unwrap());
+        registry.load_run("r2", r2, &core).await;
+
+        registry.remove_run("r1", &core).await;
+        let names: HashSet<_> = core.list_dataframes().await.into_iter().collect();
+        assert!(names.contains("b"));
+        assert!(!names.contains("a"));
     }
 }

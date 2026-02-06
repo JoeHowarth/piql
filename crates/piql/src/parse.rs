@@ -330,7 +330,7 @@ fn string_contents<'a>(quote: char) -> impl FnMut(&mut &'a str) -> PResult<Strin
                     _ => escaped, // Unknown escapes pass through
                 };
                 result.push(unescaped);
-                *input = &input[1..];
+                *input = &input[escaped.len_utf8()..];
             } else {
                 result.push(c);
                 *input = &input[c.len_utf8()..];
@@ -433,5 +433,11 @@ mod tests {
         } else {
             panic!("Expected directive");
         }
+    }
+
+    #[test]
+    fn parse_string_unknown_escape_non_ascii() {
+        let result = parse("\"\\é\"").unwrap();
+        assert!(matches!(result, Expr::Literal(Literal::String(ref s)) if s == "é"));
     }
 }

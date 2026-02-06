@@ -13,3 +13,8 @@ indexmap = "2"
 
 [dev-dependencies]
 proptest = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "hot_paths"
+harness = false

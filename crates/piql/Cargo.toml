@@ -10,3 +10,6 @@ thiserror.workspace = true
 log.workspace = true
 winnow = "0.7"
 indexmap = "2"
+
+[dev-dependencies]
+proptest = "1"

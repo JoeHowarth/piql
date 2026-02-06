@@ -62,7 +62,7 @@ use thiserror::Error;
 // ============ Primary Public API ============
 
 pub use engine::QueryEngine;
-pub use eval::{DataFrameEntry, EvalContext, TimeSeriesConfig, Value};
+pub use eval::{DataFrameEntry, DataFrameLineage, EvalContext, TimeSeriesConfig, Value};
 
 /// A query compiled to core AST for repeated execution.
 #[derive(Clone)]

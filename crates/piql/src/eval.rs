@@ -38,16 +38,45 @@ type Result<T> = std::result::Result<T, EvalError>;
 /// Runtime value produced by evaluation
 #[derive(Clone)]
 pub enum Value {
-    /// A Polars LazyFrame, with optional source name for base table routing
-    DataFrame(LazyFrame, Option<String>),
-    /// A Polars LazyGroupBy (from group_by, before agg)
-    GroupBy(LazyGroupBy),
+    /// A Polars LazyFrame with source lineage metadata
+    DataFrame(LazyFrame, DataFrameLineage),
+    /// A Polars LazyGroupBy (from group_by, before agg), retaining lineage
+    GroupBy(LazyGroupBy, DataFrameLineage),
     /// A Polars column expression
     Expr(polars::prelude::Expr),
     /// A scalar/literal value (for use in expressions)
     Scalar(ScalarValue),
     /// The `pl` namespace object
     PlNamespace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataFrameLineage {
+    /// Direct table source by name.
+    Table(String),
+    /// Derived from a single table source.
+    DerivedFrom(String),
+    /// Derived from multiple sources (e.g., join).
+    Ambiguous,
+    /// Source is unknown.
+    Unknown,
+}
+
+impl DataFrameLineage {
+    fn derived(&self) -> Self {
+        match self {
+            Self::Table(name) | Self::DerivedFrom(name) => Self::DerivedFrom(name.clone()),
+            Self::Ambiguous => Self::Ambiguous,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    fn source_name(&self) -> Option<&str> {
+        match self {
+            Self::Table(name) | Self::DerivedFrom(name) => Some(name),
+            Self::Ambiguous | Self::Unknown => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -270,13 +299,16 @@ fn eval_ident(name: &str, ctx: &EvalContext) -> Result<Value> {
         _ => {
             // Check if it's a base table - return `now` ptr for implicit now
             if let Some(now_df) = ctx.get_base_now(name) {
-                return Ok(Value::DataFrame(now_df, Some(name.to_string())));
+                return Ok(Value::DataFrame(
+                    now_df,
+                    DataFrameLineage::Table(name.to_string()),
+                ));
             }
             // Otherwise check regular dataframes
             if let Some(entry) = ctx.dataframes.get(name) {
                 Ok(Value::DataFrame(
                     entry.df.clone().lazy(),
-                    Some(name.to_string()),
+                    DataFrameLineage::Table(name.to_string()),
                 ))
             } else {
                 Err(EvalError::UnknownIdent(name.to_string()))
@@ -324,7 +356,7 @@ fn eval_attr(base: &Expr, attr: &str, ctx: &EvalContext) -> Result<Value> {
             target: "DataFrame".to_string(),
             method: attr.to_string(),
         }),
-        Value::GroupBy(_) => Err(EvalError::UnknownMethod {
+        Value::GroupBy(_, _) => Err(EvalError::UnknownMethod {
             target: "GroupBy".to_string(),
             method: attr.to_string(),
         }),
@@ -368,10 +400,10 @@ fn eval_method_call(
 
     match base_val {
         Value::PlNamespace => eval_pl_function(method, args, ctx),
-        Value::DataFrame(df, source) => {
-            eval_df_method(df, source, method, args, ctx, base_is_direct_ident)
+        Value::DataFrame(df, lineage) => {
+            eval_df_method(df, lineage, method, args, ctx, base_is_direct_ident)
         }
-        Value::GroupBy(gb) => eval_groupby_method(gb, method, args, ctx),
+        Value::GroupBy(gb, lineage) => eval_groupby_method(gb, lineage, method, args, ctx),
         Value::Expr(e) => eval_expr_method(e, method, args, ctx),
         Value::Scalar(_) => Err(EvalError::TypeError {
             expected: "Expr or DataFrame".to_string(),
@@ -420,7 +452,7 @@ fn eval_pl_function(name: &str, args: &[CoreArg], ctx: &EvalContext) -> Result<V
 
 fn eval_df_method(
     df: LazyFrame,
-    source: Option<String>,
+    lineage: DataFrameLineage,
     method: &str,
     args: &[CoreArg],
     ctx: &EvalContext,
@@ -430,29 +462,29 @@ fn eval_df_method(
         "filter" => {
             let pred = get_positional_arg(args, 0, "filter")?;
             let pred_expr = eval_to_expr(pred, ctx)?;
-            Ok(Value::DataFrame(df.filter(pred_expr), source))
+            Ok(df_value(df.filter(pred_expr), &lineage))
         }
         "select" => {
             let exprs = collect_expr_args(args, ctx)?;
-            Ok(Value::DataFrame(df.select(exprs), source))
+            Ok(df_value(df.select(exprs), &lineage))
         }
         "with_columns" => {
             let exprs = collect_expr_args(args, ctx)?;
-            Ok(Value::DataFrame(df.with_columns(exprs), source))
+            Ok(df_value(df.with_columns(exprs), &lineage))
         }
         "head" => {
             let n = get_int_arg(args, 0, "head").unwrap_or(10) as u32;
-            Ok(Value::DataFrame(df.limit(n), source))
+            Ok(df_value(df.limit(n), &lineage))
         }
         "sort" => {
             let col_names = get_strings_arg(args, 0, "sort")?;
             let descending = get_kwarg_bool(args, "descending").unwrap_or(false);
             let opts = SortMultipleOptions::new().with_order_descending(descending);
-            Ok(Value::DataFrame(df.sort(&col_names, opts), source))
+            Ok(df_value(df.sort(&col_names, opts), &lineage))
         }
         "tail" => {
             let n = get_int_arg(args, 0, "tail").unwrap_or(10) as u32;
-            Ok(Value::DataFrame(df.tail(n), source))
+            Ok(df_value(df.tail(n), &lineage))
         }
         "drop" => {
             let col_names = collect_string_args(args)?;
@@ -461,7 +493,7 @@ fn eval_df_method(
                 names,
                 strict: true,
             };
-            Ok(Value::DataFrame(df.drop(selector), source))
+            Ok(df_value(df.drop(selector), &lineage))
         }
         "explode" => {
             let col_names = collect_string_args(args)?;
@@ -470,10 +502,10 @@ fn eval_df_method(
                 names,
                 strict: true,
             };
-            Ok(Value::DataFrame(df.explode(selector), source))
+            Ok(df_value(df.explode(selector), &lineage))
         }
-        "drop_nulls" => Ok(Value::DataFrame(df.drop_nulls(None), source)),
-        "reverse" => Ok(Value::DataFrame(df.reverse(), source)),
+        "drop_nulls" => Ok(df_value(df.drop_nulls(None), &lineage)),
+        "reverse" => Ok(df_value(df.reverse(), &lineage)),
         "unique" => {
             // df.unique() or df.unique(["col1", "col2"])
             let subset = if args.is_empty() {
@@ -487,9 +519,9 @@ fn eval_df_method(
                     strict: true,
                 })
             };
-            Ok(Value::DataFrame(
+            Ok(df_value(
                 df.unique(subset, UniqueKeepStrategy::Any),
-                source,
+                &lineage,
             ))
         }
         "count" => {
@@ -499,19 +531,19 @@ fn eval_df_method(
                 .iter()
                 .map(|(name, _)| col(name.as_str()).count().alias(name.as_str()))
                 .collect();
-            Ok(Value::DataFrame(df.select(count_exprs), source))
+            Ok(df_value(df.select(count_exprs), &lineage))
         }
         "height" => {
             // Returns single-row DataFrame with row count
-            Ok(Value::DataFrame(
+            Ok(df_value(
                 df.select([polars::prelude::len().alias("height")]),
-                source,
+                &lineage,
             ))
         }
         "group_by" => {
             let col_names = collect_string_args(args)?;
             let col_exprs: Vec<_> = col_names.iter().map(col).collect();
-            Ok(Value::GroupBy(df.group_by(col_exprs)))
+            Ok(Value::GroupBy(df.group_by(col_exprs), lineage.derived()))
         }
         "rename" => {
             // Collect kwargs: rename(gold="coins", name="id")
@@ -528,27 +560,24 @@ fn eval_df_method(
 
             if !renames.is_empty() {
                 let (old_names, new_names): (Vec<_>, Vec<_>) = renames.into_iter().unzip();
-                Ok(Value::DataFrame(
-                    df.rename(old_names, new_names, false),
-                    source,
-                ))
+                Ok(df_value(df.rename(old_names, new_names, false), &lineage))
             } else {
                 // Positional fallback: rename("old", "new")
                 let old = get_string_arg(args, 0, "rename")?;
                 let new = get_string_arg(args, 1, "rename")?;
-                Ok(Value::DataFrame(df.rename([old], [new], false), source))
+                Ok(df_value(df.rename([old], [new], false), &lineage))
             }
         }
         // Scope methods for time-series data
         "all" => {
             // For direct base-table access, swap to `all` ptr; otherwise keep current df.
             if base_is_direct_ident
-                && let Some(ref name) = source
+                && let Some(name) = lineage.source_name()
                 && let Some(all_df) = ctx.get_base_all(name)
             {
-                return Ok(Value::DataFrame(all_df, source));
+                return Ok(df_value(all_df, &lineage));
             }
-            Ok(Value::DataFrame(df, source))
+            Ok(df_value(df, &lineage))
         }
         "window" => {
             // For direct base-table access, scope against `all`; otherwise scope current df.
@@ -557,33 +586,33 @@ fn eval_df_method(
             let tick = ctx
                 .tick
                 .ok_or_else(|| EvalError::Other(".window() requires tick in context".into()))?;
-            let tick_col = resolve_scope_tick_column(source.as_deref(), ctx, "window")?;
-            let target_df = scope_target_df(df, source.as_deref(), ctx, base_is_direct_ident);
+            let tick_col = resolve_scope_tick_column(&lineage, ctx, "window")?;
+            let target_df = scope_target_df(df, &lineage, ctx, base_is_direct_ident);
 
             let filtered = target_df.filter(col(&tick_col).is_between(
                 lit(tick + a),
                 lit(tick + b),
                 ClosedInterval::Both,
             ));
-            Ok(Value::DataFrame(filtered, source))
+            Ok(df_value(filtered, &lineage))
         }
         "since" => {
             // For direct base-table access, scope against `all`; otherwise scope current df.
             let n = get_int_arg(args, 0, "since")?;
-            let tick_col = resolve_scope_tick_column(source.as_deref(), ctx, "since")?;
-            let target_df = scope_target_df(df, source.as_deref(), ctx, base_is_direct_ident);
+            let tick_col = resolve_scope_tick_column(&lineage, ctx, "since")?;
+            let target_df = scope_target_df(df, &lineage, ctx, base_is_direct_ident);
 
             let filtered = target_df.filter(col(&tick_col).gt_eq(lit(n)));
-            Ok(Value::DataFrame(filtered, source))
+            Ok(df_value(filtered, &lineage))
         }
         "at" => {
             // For direct base-table access, scope against `all`; otherwise scope current df.
             let n = get_int_arg(args, 0, "at")?;
-            let tick_col = resolve_scope_tick_column(source.as_deref(), ctx, "at")?;
-            let target_df = scope_target_df(df, source.as_deref(), ctx, base_is_direct_ident);
+            let tick_col = resolve_scope_tick_column(&lineage, ctx, "at")?;
+            let target_df = scope_target_df(df, &lineage, ctx, base_is_direct_ident);
 
             let filtered = target_df.filter(col(&tick_col).eq(lit(n)));
-            Ok(Value::DataFrame(filtered, source))
+            Ok(df_value(filtered, &lineage))
         }
         // Convenience method
         "top" => {
@@ -591,7 +620,7 @@ fn eval_df_method(
             let n = get_int_arg(args, 0, "top")? as u32;
             let sort_col = get_string_arg(args, 1, "top")?;
             let opts = SortMultipleOptions::new().with_order_descending(true);
-            Ok(Value::DataFrame(df.sort([sort_col], opts).limit(n), source))
+            Ok(df_value(df.sort([sort_col], opts).limit(n), &lineage))
         }
         "describe" => {
             // Build describe statistics via lazy aggregations (no blocking collect)
@@ -644,7 +673,7 @@ fn eval_df_method(
             col_order.extend(numeric_cols.iter().map(col));
             let result = result.select(col_order);
 
-            Ok(Value::DataFrame(result, source))
+            Ok(df_value(result, &lineage))
         }
         "join" => {
             // Get the other dataframe (first positional arg)
@@ -691,7 +720,7 @@ fn eval_df_method(
                 df.join(other, left_exprs, right_exprs, JoinArgs::new(join_type))
             };
 
-            Ok(Value::DataFrame(result, None)) // join merges two sources; clear lineage
+            Ok(Value::DataFrame(result, DataFrameLineage::Ambiguous))
         }
         _ => Err(EvalError::UnknownMethod {
             target: "DataFrame".to_string(),
@@ -700,14 +729,18 @@ fn eval_df_method(
     }
 }
 
+fn df_value(df: LazyFrame, lineage: &DataFrameLineage) -> Value {
+    Value::DataFrame(df, lineage.derived())
+}
+
 fn scope_target_df(
     df: LazyFrame,
-    source: Option<&str>,
+    lineage: &DataFrameLineage,
     ctx: &EvalContext,
     base_is_direct_ident: bool,
 ) -> LazyFrame {
     if base_is_direct_ident
-        && let Some(name) = source
+        && let Some(name) = lineage.source_name()
         && let Some(entry) = ctx.base_tables.get(name)
         && let Some(all_df) = entry.all.clone()
     {
@@ -718,11 +751,17 @@ fn scope_target_df(
 }
 
 fn resolve_scope_tick_column(
-    source: Option<&str>,
+    lineage: &DataFrameLineage,
     ctx: &EvalContext,
     method: &str,
 ) -> Result<String> {
-    if let Some(name) = source {
+    if matches!(lineage, DataFrameLineage::Ambiguous) {
+        return Err(EvalError::Other(format!(
+            ".{method}() has ambiguous lineage; call .at/.since/.window before joins or configure an explicit tick column"
+        )));
+    }
+
+    if let Some(name) = lineage.source_name() {
         if let Some(entry) = ctx.base_tables.get(name) {
             return Ok(entry.config.tick_column.clone());
         }
@@ -743,6 +782,7 @@ fn resolve_scope_tick_column(
 
 fn eval_groupby_method(
     gb: LazyGroupBy,
+    lineage: DataFrameLineage,
     method: &str,
     args: &[CoreArg],
     ctx: &EvalContext,
@@ -750,7 +790,7 @@ fn eval_groupby_method(
     match method {
         "agg" => {
             let exprs = collect_expr_args(args, ctx)?;
-            Ok(Value::DataFrame(gb.agg(exprs), None)) // agg produces new shape
+            Ok(Value::DataFrame(gb.agg(exprs), lineage.derived())) // agg produces new shape
         }
         _ => Err(EvalError::UnknownMethod {
             target: "GroupBy".to_string(),
@@ -980,7 +1020,7 @@ fn eval_to_expr(expr: &Expr, ctx: &EvalContext) -> Result<polars::prelude::Expr>
             expected: "Expr".to_string(),
             got: "DataFrame".to_string(),
         }),
-        Value::GroupBy(_) => Err(EvalError::TypeError {
+        Value::GroupBy(_, _) => Err(EvalError::TypeError {
             expected: "Expr".to_string(),
             got: "GroupBy".to_string(),
         }),

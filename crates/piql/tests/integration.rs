@@ -1315,6 +1315,50 @@ fn scope_at_without_tick_config_errors() {
 }
 
 #[test]
+fn scope_on_joined_time_series_reports_ambiguous_lineage() {
+    let left = df! {
+        "id" => &[1, 2],
+        "tick" => &[1, 1],
+        "value_l" => &[10, 20],
+    }
+    .unwrap()
+    .lazy();
+    let right = df! {
+        "id" => &[1, 2],
+        "tick" => &[1, 1],
+        "value_r" => &[100, 200],
+    }
+    .unwrap()
+    .lazy();
+
+    let ctx = EvalContext::new()
+        .with_time_series_df(
+            "left",
+            left,
+            TimeSeriesConfig {
+                tick_column: "tick".into(),
+                partition_key: "id".into(),
+            },
+        )
+        .with_time_series_df(
+            "right",
+            right,
+            TimeSeriesConfig {
+                tick_column: "tick".into(),
+                partition_key: "id".into(),
+            },
+        );
+
+    match run(r#"left.join(right, on="id").at(1)"#, &ctx) {
+        Ok(_) => panic!("expected ambiguous lineage error"),
+        Err(err) => assert!(
+            err.to_string().contains("ambiguous lineage"),
+            "unexpected error: {err}"
+        ),
+    }
+}
+
+#[test]
 fn scope_top() {
     let ctx = setup_test_df();
     // top(2, "gold") should get top 2 by gold descending

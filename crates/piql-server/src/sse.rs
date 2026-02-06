@@ -6,15 +6,14 @@ use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use base64::Engine;
 use futures::stream::{self, Stream, StreamExt};
 use log::{debug, info, warn};
-use polars::prelude::*;
 use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 use utoipa::IntoParams;
 
 use crate::core::ServerCore;
+use crate::ipc::dataframe_to_base64_ipc;
 
 #[derive(Deserialize, IntoParams)]
 pub struct SubscribeParams {
@@ -46,8 +45,7 @@ pub async fn subscribe(
     let update_rx = core.subscribe_updates();
 
     // Create a stream that emits on updates
-    let update_stream = BroadcastStream::new(update_rx)
-        .filter_map(|_| async { Some(()) });
+    let update_stream = BroadcastStream::new(update_rx).filter_map(|_| async { Some(()) });
 
     // Prepend an immediate trigger to emit initial results
     let trigger_stream = stream::once(async {}).chain(update_stream);
@@ -61,37 +59,22 @@ pub async fn subscribe(
             match execute_and_encode(&core, &query).await {
                 Ok(data) => {
                     debug!("SSE result: {} bytes", data.len());
-                    Event::default()
-                        .event("result")
-                        .data(data)
+                    Event::default().event("result").data(data)
                 }
                 Err(e) => {
                     warn!("SSE error: {}", e);
-                    Event::default()
-                        .event("error")
-                        .data(e)
+                    Event::default().event("error").data(e)
                 }
             }
         }
     });
 
     debug!("SSE subscription started for: {}", query_for_log);
-    Sse::new(event_stream.map(Ok))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+    Sse::new(event_stream.map(Ok)).keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
 }
 
 /// Execute query and encode result as base64 Arrow IPC
 async fn execute_and_encode(core: &ServerCore, query: &str) -> Result<String, String> {
-    let mut df = core.execute_query(query).await.map_err(|e| e.to_string())?;
-
-    let buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, PolarsError> {
-        let mut buf = Vec::new();
-        IpcStreamWriter::new(&mut buf).finish(&mut df)?;
-        Ok(buf)
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
-    .map_err(|e| e.to_string())?;
-
-    Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+    let df = core.execute_query(query).await.map_err(|e| e.to_string())?;
+    dataframe_to_base64_ipc(df).await.map_err(|e| e.to_string())
 }

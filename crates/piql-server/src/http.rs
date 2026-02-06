@@ -3,14 +3,15 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::State;
-use axum::http::{header, StatusCode};
-use axum::response::IntoResponse;
 use axum::Json;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
 use log::{debug, info, warn};
 use polars::prelude::*;
 
 use crate::core::ServerCore;
+use crate::ipc::{IpcEncodeError, dataframe_to_ipc_bytes};
 use crate::state::{DataframesResponse, ErrorResponse};
 
 /// Application error type
@@ -38,6 +39,12 @@ impl From<PolarsError> for AppError {
     }
 }
 
+impl From<IpcEncodeError> for AppError {
+    fn from(e: IpcEncodeError) -> Self {
+        AppError(e.to_string())
+    }
+}
+
 /// Execute a piql query
 #[utoipa::path(
     post,
@@ -56,7 +63,7 @@ pub async fn query(
     info!("POST /query: {}", body.lines().next().unwrap_or(&body));
     debug!("Full query: {}", body);
 
-    let mut df = match core.execute_query(&body).await {
+    let df = match core.execute_query(&body).await {
         Ok(df) => df,
         Err(e) => {
             warn!("Query failed in {:.2?}: {}", start.elapsed(), e);
@@ -64,22 +71,15 @@ pub async fn query(
         }
     };
 
-    // Serialize to Arrow IPC (blocking but fast for in-memory data)
-    let buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, PolarsError> {
-        let mut buf = Vec::new();
-        IpcStreamWriter::new(&mut buf).finish(&mut df)?;
-        Ok(buf)
-    })
-    .await
-    .map_err(|e| AppError(format!("Task join error: {}", e)))?
-    .map_err(AppError::from)?;
+    let buf = dataframe_to_ipc_bytes(df).await.map_err(AppError::from)?;
 
-    info!("Query succeeded in {:.2?}, {} bytes", start.elapsed(), buf.len());
+    info!(
+        "Query succeeded in {:.2?}, {} bytes",
+        start.elapsed(),
+        buf.len()
+    );
     Ok((
-        [(
-            header::CONTENT_TYPE,
-            "application/vnd.apache.arrow.stream",
-        )],
+        [(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")],
         buf,
     ))
 }

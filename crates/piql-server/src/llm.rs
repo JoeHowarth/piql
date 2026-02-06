@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::{header, HeaderName, HeaderValue};
+use axum::http::{HeaderName, HeaderValue, header};
 use axum::response::IntoResponse;
 use log::{debug, info, warn};
 use piql::EvalContext;
@@ -14,6 +14,7 @@ use serde::Deserialize;
 use utoipa::{IntoParams, OpenApi};
 
 use crate::core::ServerCore;
+use crate::ipc::dataframe_to_ipc_bytes;
 
 /// OpenAPI documentation for LLM endpoints
 #[derive(OpenApi)]
@@ -56,15 +57,39 @@ When aliasing arithmetic expressions, you MUST wrap the expression in parenthese
 
 /// Example query templates - {table}, {str_col}, {num_col}, {cat_col} are placeholders
 const EXAMPLE_TEMPLATES: &[(&str, &str)] = &[
-    ("Filter numeric", "{table}.filter(pl.col(\"{num_col}\") > {num_val})"),
-    ("Filter string equality", "{table}.filter(pl.col(\"{cat_col}\") == \"{cat_val}\")"),
-    ("Select columns", "{table}.select(pl.col(\"{str_col}\"), pl.col(\"{num_col}\"))"),
-    ("Sort descending", "{table}.sort(\"{num_col}\", descending=True)"),
+    (
+        "Filter numeric",
+        "{table}.filter(pl.col(\"{num_col}\") > {num_val})",
+    ),
+    (
+        "Filter string equality",
+        "{table}.filter(pl.col(\"{cat_col}\") == \"{cat_val}\")",
+    ),
+    (
+        "Select columns",
+        "{table}.select(pl.col(\"{str_col}\"), pl.col(\"{num_col}\"))",
+    ),
+    (
+        "Sort descending",
+        "{table}.sort(\"{num_col}\", descending=True)",
+    ),
     ("Head", "{table}.head(5)"),
-    ("Group by + count", "{table}.group_by(\"{cat_col}\").agg(pl.col(\"{str_col}\").count().alias(\"count\"))"),
-    ("String contains", "{table}.filter(pl.col(\"{str_col}\").str.contains(\"{str_fragment}\"))"),
-    ("Multiply with alias", "{table}.with_columns((pl.col(\"{num_col}\") * 2).alias(\"doubled\"))"),
-    ("Subtract two columns with alias", "{table}.with_columns((pl.col(\"end\") - pl.col(\"start\")).alias(\"duration\"))"),
+    (
+        "Group by + count",
+        "{table}.group_by(\"{cat_col}\").agg(pl.col(\"{str_col}\").count().alias(\"count\"))",
+    ),
+    (
+        "String contains",
+        "{table}.filter(pl.col(\"{str_col}\").str.contains(\"{str_fragment}\"))",
+    ),
+    (
+        "Multiply with alias",
+        "{table}.with_columns((pl.col(\"{num_col}\") * 2).alias(\"doubled\"))",
+    ),
+    (
+        "Subtract two columns with alias",
+        "{table}.with_columns((pl.col(\"end\") - pl.col(\"start\")).alias(\"duration\"))",
+    ),
 ];
 
 /// Column info extracted from a dataframe
@@ -135,14 +160,18 @@ pub async fn get_schema_and_examples(ctx: &EvalContext) -> (String, String) {
                     }
                 }
 
-                Some((name, sample_str, ColumnInfo {
-                    str_cols,
-                    num_cols,
-                    cat_col,
-                    sample_str: sample_str_val,
-                    sample_num,
-                    sample_cat,
-                }))
+                Some((
+                    name,
+                    sample_str,
+                    ColumnInfo {
+                        str_cols,
+                        num_cols,
+                        cat_col,
+                        sample_str: sample_str_val,
+                        sample_num,
+                        sample_cat,
+                    },
+                ))
             })
             .collect()
     })
@@ -155,13 +184,18 @@ pub async fn get_schema_and_examples(ctx: &EvalContext) -> (String, String) {
     }
 
     let mut examples = String::new();
-    if let Some((table, _, info)) = results.iter().find(|(_, _, i)| !i.str_cols.is_empty() && !i.num_cols.is_empty()) {
+    if let Some((table, _, info)) = results
+        .iter()
+        .find(|(_, _, i)| !i.str_cols.is_empty() && !i.num_cols.is_empty())
+    {
         let str_col = info.str_cols.first().map(|s| s.as_str()).unwrap_or("name");
         let num_col = info.num_cols.first().map(|s| s.as_str()).unwrap_or("id");
         let cat_col = info.cat_col.as_deref().unwrap_or(str_col);
         let num_val = info.sample_num.unwrap_or(100);
         let cat_val = info.sample_cat.as_deref().unwrap_or("value");
-        let str_fragment = info.sample_str.as_deref()
+        let str_fragment = info
+            .sample_str
+            .as_deref()
             .and_then(|s| s.get(0..3))
             .unwrap_or("abc");
 
@@ -285,11 +319,10 @@ async fn generate_valid_query(prompt: &str, system: &str) -> Result<String, AppE
     debug!("LLM retry returned: {}", query);
 
     // Validate the retry and pretty-print
-    let expr = piql::advanced::parse(&query)
-        .map_err(|e| {
-            warn!("Retry also failed: {}", e);
-            AppError(format!("Generated invalid PiQL after retry: {}", e))
-        })?;
+    let expr = piql::advanced::parse(&query).map_err(|e| {
+        warn!("Retry also failed: {}", e);
+        AppError(format!("Generated invalid PiQL after retry: {}", e))
+    })?;
 
     let pretty = piql::advanced::pretty(&expr, 80);
     info!("Generated valid query on retry ({} chars)", pretty.len());
@@ -337,16 +370,10 @@ pub async fn ask(
     let query = generate_valid_query(&body, &system_prompt).await?;
 
     let response_body = if params.execute {
-        let mut df = core.execute_query(&query).await?;
-
-        tokio::task::spawn_blocking(move || -> Result<Vec<u8>, PolarsError> {
-            let mut buf = Vec::new();
-            IpcStreamWriter::new(&mut buf).finish(&mut df)?;
-            Ok(buf)
-        })
-        .await
-        .map_err(|e| AppError(format!("Task join error: {}", e)))?
-        .map_err(|e| AppError(e.to_string()))?
+        let df = core.execute_query(&query).await?;
+        dataframe_to_ipc_bytes(df)
+            .await
+            .map_err(|e| AppError(e.to_string()))?
     } else {
         Vec::new()
     };

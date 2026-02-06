@@ -32,6 +32,7 @@
 
 pub mod core;
 pub mod http;
+pub mod ipc;
 pub mod loader;
 pub mod sse;
 pub mod state;
@@ -50,22 +51,15 @@ pub use state::{DfUpdate, SharedState};
 
 use std::sync::Arc;
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 use utoipa::OpenApi;
 
 /// OpenAPI documentation (base endpoints)
 #[derive(OpenApi)]
 #[openapi(
-    paths(
-        http::query,
-        http::list_dataframes,
-        sse::subscribe,
-    ),
-    components(schemas(
-        state::DataframesResponse,
-        state::ErrorResponse,
-    ))
+    paths(http::query, http::list_dataframes, sse::subscribe,),
+    components(schemas(state::DataframesResponse, state::ErrorResponse,))
 )]
 struct ApiDocBase;
 
@@ -102,5 +96,6 @@ pub fn build_router(core: Arc<ServerCore>) -> Router {
 pub fn build_router_with_docs(core: Arc<ServerCore>) -> Router {
     use utoipa_swagger_ui::SwaggerUi;
 
-    build_router(core).merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi_spec()))
+    build_router(core)
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi_spec()))
 }

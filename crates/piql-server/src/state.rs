@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use piql::{DataFrameEntry, EvalContext};
+use piql::{DataFrameEntry, EvalContext, TimeSeriesConfig};
 use polars::prelude::*;
 use serde::Serialize;
 use tokio::sync::{RwLock, broadcast};
@@ -102,6 +102,24 @@ impl SharedState {
         let mut names: Vec<String> = ctx.dataframes.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Register per-table time-series metadata for scope/sugar behavior.
+    pub async fn set_time_series_config(
+        &self,
+        name: &str,
+        config: TimeSeriesConfig,
+    ) -> Result<(), piql::PiqlError> {
+        let mut ctx = self.ctx.write().await;
+        let entry = ctx
+            .dataframes
+            .get_mut(name)
+            .ok_or_else(|| piql::EvalError::UnknownIdent(name.to_string()))?;
+        entry.time_series = Some(config);
+        drop(ctx);
+        // Notify subscribers that query behavior may have changed.
+        let _ = self.update_tx.send(());
+        Ok(())
     }
 
     /// Execute a query and collect results (runs on blocking thread pool)

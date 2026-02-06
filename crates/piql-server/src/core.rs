@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use piql::TimeSeriesConfig;
 use polars::prelude::*;
 use tokio::sync::broadcast;
 
@@ -57,6 +58,15 @@ impl ServerCore {
         self.state.apply_update(update).await;
     }
 
+    /// Register per-table time-series metadata for scope/sugar behavior.
+    pub async fn set_time_series_config(
+        &self,
+        name: &str,
+        config: TimeSeriesConfig,
+    ) -> Result<(), piql::PiqlError> {
+        self.state.set_time_series_config(name, config).await
+    }
+
     /// List all DataFrame names
     pub async fn list_dataframes(&self) -> Vec<String> {
         self.state.list_dataframes().await
@@ -71,5 +81,37 @@ impl ServerCore {
 impl Default for ServerCore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use piql::TimeSeriesConfig;
+    use polars::df;
+
+    #[tokio::test]
+    async fn per_table_time_series_config_enables_scope_queries() {
+        let core = ServerCore::new();
+        let df = df! {
+            "id" => &[1, 1, 2, 2],
+            "step" => &[1, 2, 1, 2],
+            "value" => &[10, 20, 30, 40],
+        }
+        .unwrap();
+        core.insert_df("events", df).await;
+
+        core.set_time_series_config(
+            "events",
+            TimeSeriesConfig {
+                tick_column: "step".into(),
+                partition_key: "id".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = core.execute_query("events.at(2)").await.unwrap();
+        assert_eq!(result.height(), 2);
     }
 }

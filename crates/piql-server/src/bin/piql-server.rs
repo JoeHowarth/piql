@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
+use piql::TimeSeriesConfig;
 
 #[derive(Parser)]
 #[command(name = "piql-server")]
@@ -63,6 +65,11 @@ struct Args {
     /// Maximum rows to return from queries. Default 100000. Use 0 for unlimited.
     #[arg(long, default_value = "100000")]
     max_rows: u32,
+
+    /// Register table time-series metadata as TABLE:TICK_COLUMN:PARTITION_KEY.
+    /// Repeat this flag to configure multiple tables.
+    #[arg(long = "time-series", value_name = "TABLE:TICK:PARTITION")]
+    time_series: Vec<String>,
 }
 
 #[tokio::main]
@@ -135,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    apply_time_series_configs(&core, &args.time_series).await?;
+
     let router = piql_server::build_router_with_docs(core);
 
     let addr = format!("{}:{}", args.host, args.port);
@@ -150,4 +159,57 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, router).await?;
 
     Ok(())
+}
+
+async fn apply_time_series_configs(
+    core: &Arc<piql_server::ServerCore>,
+    specs: &[String],
+) -> anyhow::Result<()> {
+    for spec in specs {
+        let (table, tick_column, partition_key) = parse_time_series_spec(spec)?;
+        core.set_time_series_config(
+            &table,
+            TimeSeriesConfig {
+                tick_column,
+                partition_key,
+            },
+        )
+        .await
+        .with_context(|| format!("failed to register time-series config for table '{table}'"))?;
+        log::info!("Registered time-series config for table: {table}");
+    }
+    Ok(())
+}
+
+fn parse_time_series_spec(spec: &str) -> anyhow::Result<(String, String, String)> {
+    let invalid = || anyhow::anyhow!("invalid --time-series spec '{spec}'");
+    let mut parts = spec.splitn(3, ':');
+    let table = parts.next().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+    let tick_column = parts.next().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+    let partition_key = parts.next().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+    Ok((
+        table.to_string(),
+        tick_column.to_string(),
+        partition_key.to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_time_series_spec;
+
+    #[test]
+    fn parse_time_series_spec_valid() {
+        let (table, tick, partition) = parse_time_series_spec("events:step:id").unwrap();
+        assert_eq!(table, "events");
+        assert_eq!(tick, "step");
+        assert_eq!(partition, "id");
+    }
+
+    #[test]
+    fn parse_time_series_spec_invalid() {
+        assert!(parse_time_series_spec("events:step").is_err());
+        assert!(parse_time_series_spec("::").is_err());
+        assert!(parse_time_series_spec("events::id").is_err());
+    }
 }

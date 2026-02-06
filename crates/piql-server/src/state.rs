@@ -5,7 +5,7 @@ use std::sync::Arc;
 use piql::{DataFrameEntry, EvalContext};
 use polars::prelude::*;
 use serde::Serialize;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use utoipa::ToSchema;
 
 /// DataFrame update message
@@ -119,7 +119,9 @@ impl SharedState {
                     } else {
                         lf
                     };
-                    lf.collect().map_err(piql::EvalError::from).map_err(piql::PiqlError::from)
+                    lf.collect()
+                        .map_err(piql::EvalError::from)
+                        .map_err(piql::PiqlError::from)
                 }
                 _ => Err(piql::PiqlError::Eval(piql::EvalError::TypeError {
                     expected: "DataFrame".to_string(),
@@ -129,27 +131,6 @@ impl SharedState {
         })
         .await
         .map_err(|e| piql::PiqlError::Eval(piql::EvalError::Other(format!("task failed: {e}"))))?
-    }
-}
-
-impl Default for SharedState {
-    fn default() -> Self {
-        let (state, _) = Self::new();
-        // We need to return the inner state, not the Arc
-        // This is a bit awkward but maintains the Default trait
-        Arc::try_unwrap(state).unwrap_or_else(|arc| (*arc).clone())
-    }
-}
-
-impl Clone for SharedState {
-    fn clone(&self) -> Self {
-        // Can't really clone SharedState meaningfully, create a new one
-        let (update_tx, _) = broadcast::channel(16);
-        Self {
-            ctx: RwLock::new(EvalContext::new()),
-            update_tx,
-            max_rows: None,
-        }
     }
 }
 

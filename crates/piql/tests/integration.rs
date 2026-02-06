@@ -5,6 +5,8 @@
 use piql::expr_helpers::{binop, lit_int, lit_str, pl_col};
 use piql::{BinOp, EvalContext, QueryEngine, TimeSeriesConfig, Value, run};
 use polars::prelude::*;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn setup_test_df() -> EvalContext {
     let df = df! {
@@ -1603,6 +1605,36 @@ fn query_engine_materialized_chain() {
     // At tick 2, type_a entities are 1 (150) and 3 (75)
     // rich_a filters to gold > 100, so only entity 1
     assert_eq!(report.height(), 1);
+}
+
+#[test]
+fn query_engine_subscription_directive_is_compiled_once() {
+    let df = df! {
+        "type" => &["a", "b", "a"],
+        "value" => &[1, 2, 3],
+    }
+    .unwrap()
+    .lazy();
+
+    let mut engine = QueryEngine::new();
+    engine.add_base_df("entities", df);
+
+    let expansion_count = Arc::new(AtomicUsize::new(0));
+    let expansion_count_clone = expansion_count.clone();
+    engine.sugar().register_directive("counted", move |_, _| {
+        expansion_count_clone.fetch_add(1, Ordering::SeqCst);
+        binop(pl_col("type"), BinOp::Eq, lit_str("a"))
+    });
+
+    engine.subscribe("only_a", r#"entities.filter(@counted)"#);
+    engine.on_tick(1).unwrap();
+    engine.on_tick(2).unwrap();
+
+    assert_eq!(
+        expansion_count.load(Ordering::SeqCst),
+        1,
+        "directive expansion should happen once at compile time"
+    );
 }
 
 // ============ Base Table Routing ============

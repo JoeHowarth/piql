@@ -64,14 +64,31 @@ use thiserror::Error;
 pub use engine::QueryEngine;
 pub use eval::{DataFrameEntry, EvalContext, TimeSeriesConfig, Value};
 
-/// Run a one-off query
-pub fn run(query: &str, ctx: &EvalContext) -> Result<Value, PiqlError> {
+/// A query compiled to core AST for repeated execution.
+#[derive(Clone)]
+pub struct CompiledQuery {
+    core: ast::core::Expr,
+}
+
+/// Compile a query once for repeated execution.
+pub fn compile(query: &str, ctx: &EvalContext) -> Result<CompiledQuery, PiqlError> {
     let surface = parse::parse(query)?;
     let root_df = infer_root_dataframe_name(&surface);
     let sugar_ctx = ctx.sugar_context(root_df);
     let core = transform::transform_with_sugar(surface, &ctx.sugar, &sugar_ctx);
-    let result = eval::eval(&core, ctx)?;
+    Ok(CompiledQuery { core })
+}
+
+/// Run a pre-compiled query.
+pub fn run_compiled(compiled: &CompiledQuery, ctx: &EvalContext) -> Result<Value, PiqlError> {
+    let result = eval::eval(&compiled.core, ctx)?;
     Ok(result)
+}
+
+/// Run a one-off query
+pub fn run(query: &str, ctx: &EvalContext) -> Result<Value, PiqlError> {
+    let compiled = compile(query, ctx)?;
+    run_compiled(&compiled, ctx)
 }
 
 fn infer_root_dataframe_name(expr: &ast::surface::Expr) -> Option<&str> {

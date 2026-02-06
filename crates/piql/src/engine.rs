@@ -10,7 +10,7 @@ use polars::prelude::*;
 use std::collections::HashMap;
 
 use crate::eval::{EvalContext, TimeSeriesConfig};
-use crate::{PiqlError, Value, run};
+use crate::{CompiledQuery, PiqlError, Value, compile, run, run_compiled};
 
 /// State for a base table that grows each tick
 #[derive(Clone)]
@@ -50,10 +50,39 @@ pub struct QueryEngine {
 
     /// Materialized tables: name -> query
     /// Evaluated in insertion order each tick (user ensures correct dependency order)
-    materialized: IndexMap<String, String>,
+    materialized: IndexMap<String, CachedQuery>,
 
     /// Subscribed queries: name -> query
-    subscriptions: HashMap<String, String>,
+    subscriptions: HashMap<String, CachedQuery>,
+}
+
+#[derive(Clone)]
+struct CachedQuery {
+    query: String,
+    compiled: Option<CompiledQuery>,
+}
+
+impl CachedQuery {
+    fn new(query: String) -> Self {
+        Self {
+            query,
+            compiled: None,
+        }
+    }
+
+    fn from_compiled(query: String, compiled: CompiledQuery) -> Self {
+        Self {
+            query,
+            compiled: Some(compiled),
+        }
+    }
+
+    fn get_or_compile(&mut self, ctx: &EvalContext) -> Result<&CompiledQuery, PiqlError> {
+        if self.compiled.is_none() {
+            self.compiled = Some(compile(&self.query, ctx)?);
+        }
+        Ok(self.compiled.as_ref().expect("compiled query missing"))
+    }
 }
 
 impl QueryEngine {
@@ -170,11 +199,11 @@ impl QueryEngine {
     ) -> Result<(), PiqlError> {
         let name = name.into();
         let query = query.into();
+        let compiled = compile(&query, &self.ctx)?;
 
         // Evaluate immediately
-        let result = run(&query, &self.ctx)?;
-        if let Value::DataFrame(lf, _) = result {
-            let collected = lf.collect().map_err(crate::eval::EvalError::from)?;
+        let result = run_compiled(&compiled, &self.ctx)?;
+        if let Some(collected) = collect_value_df(result)? {
             self.ctx.dataframes.insert(
                 name.clone(),
                 crate::eval::DataFrameEntry {
@@ -184,7 +213,8 @@ impl QueryEngine {
             );
         }
 
-        self.materialized.insert(name, query);
+        self.materialized
+            .insert(name, CachedQuery::from_compiled(query, compiled));
         Ok(())
     }
 
@@ -192,7 +222,8 @@ impl QueryEngine {
     ///
     /// Results are computed each tick and returned from `on_tick()`.
     pub fn subscribe(&mut self, name: impl Into<String>, query: impl Into<String>) {
-        self.subscriptions.insert(name.into(), query.into());
+        self.subscriptions
+            .insert(name.into(), CachedQuery::new(query.into()));
     }
 
     /// Unsubscribe from a query
@@ -207,11 +238,10 @@ impl QueryEngine {
         self.ctx.tick = Some(tick);
 
         // 1. Re-evaluate materialized tables in order
-        for (name, query) in &self.materialized {
-            let result = run(query, &self.ctx)?;
-            if let Value::DataFrame(lf, _) = result {
+        for (name, cached) in &mut self.materialized {
+            let result = eval_cached_query(cached, &self.ctx)?;
+            if let Some(collected) = collect_value_df(result)? {
                 // Store as new DF entry (no time-series config for derived tables)
-                let collected = lf.collect().map_err(crate::eval::EvalError::from)?;
                 self.ctx.dataframes.insert(
                     name.clone(),
                     crate::eval::DataFrameEntry {
@@ -224,10 +254,9 @@ impl QueryEngine {
 
         // 2. Evaluate all subscriptions
         let mut results = HashMap::new();
-        for (name, query) in &self.subscriptions {
-            let result = run(query, &self.ctx)?;
-            if let Value::DataFrame(df, _) = result {
-                let collected = df.collect().map_err(crate::eval::EvalError::from)?;
+        for (name, cached) in &mut self.subscriptions {
+            let result = eval_cached_query(cached, &self.ctx)?;
+            if let Some(collected) = collect_value_df(result)? {
                 results.insert(name.clone(), collected);
             }
         }
@@ -269,5 +298,17 @@ impl QueryEngine {
 impl Default for QueryEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn eval_cached_query(cached: &mut CachedQuery, ctx: &EvalContext) -> Result<Value, PiqlError> {
+    let compiled = cached.get_or_compile(ctx)?;
+    run_compiled(compiled, ctx)
+}
+
+fn collect_value_df(value: Value) -> Result<Option<DataFrame>, PiqlError> {
+    match value {
+        Value::DataFrame(lf, _) => Ok(Some(lf.collect().map_err(crate::eval::EvalError::from)?)),
+        _ => Ok(None),
     }
 }

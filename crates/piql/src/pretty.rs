@@ -342,7 +342,11 @@ mod tests {
 
         // Verify the structure: first method on same line as base
         let lines: Vec<&str> = pretty.lines().collect();
-        assert!(lines[0].starts_with("df.filter("), "First method on same line: {}", pretty);
+        assert!(
+            lines[0].starts_with("df.filter("),
+            "First method on same line: {}",
+            pretty
+        );
         assert!(lines[1].trim().starts_with(".select("));
     }
 

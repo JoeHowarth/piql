@@ -207,16 +207,13 @@ fn build_when_then_otherwise(
     registry: &SugarRegistry,
     ctx: &SugarContext,
 ) -> CoreExpr {
-    let Some(otherwise_value) = otherwise_args
-        .into_iter()
-        .find_map(|arg| {
-            if let Arg::Positional(e) = arg {
-                Some(e)
-            } else {
-                None
-            }
-        })
-    else {
+    let Some(otherwise_value) = otherwise_args.into_iter().find_map(|arg| {
+        if let Arg::Positional(e) = arg {
+            Some(e)
+        } else {
+            None
+        }
+    }) else {
         return CoreExpr::Invalid("otherwise() requires an argument".to_string());
     };
 

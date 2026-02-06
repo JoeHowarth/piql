@@ -446,7 +446,10 @@ fn group_by_list_syntax() {
 #[test]
 fn group_by_with_col_shorthand() {
     let ctx = setup_test_df();
-    let df = run_to_df(r#"entities.group_by($type).agg(pl.col("gold").sum())"#, &ctx);
+    let df = run_to_df(
+        r#"entities.group_by($type).agg(pl.col("gold").sum())"#,
+        &ctx,
+    );
     assert_eq!(df.height(), 2); // merchant and producer
 }
 
@@ -636,7 +639,9 @@ fn df_unique_all_columns() {
     let df = df!(
         "a" => [1, 1, 2, 2],
         "b" => ["x", "x", "y", "z"]
-    ).unwrap().lazy();
+    )
+    .unwrap()
+    .lazy();
     let ctx = EvalContext::new().with_df("test", df);
     let result = run_to_df(r#"test.unique()"#, &ctx);
     assert_eq!(result.height(), 3); // (1,x), (2,y), (2,z)
@@ -648,7 +653,9 @@ fn df_unique_subset() {
     let df = df!(
         "a" => [1, 1, 2, 2],
         "b" => ["x", "y", "z", "w"]
-    ).unwrap().lazy();
+    )
+    .unwrap()
+    .lazy();
     let ctx = EvalContext::new().with_df("test", df);
     let result = run_to_df(r#"test.unique(["a"])"#, &ctx);
     assert_eq!(result.height(), 2); // one row per unique 'a'
@@ -1326,7 +1333,10 @@ fn unknown_directive_returns_error() {
 #[test]
 fn otherwise_without_arg_returns_error() {
     let ctx = setup_test_df();
-    match run(r#"entities.with_columns(pl.when(True).then(1).otherwise())"#, &ctx) {
+    match run(
+        r#"entities.with_columns(pl.when(True).then(1).otherwise())"#,
+        &ctx,
+    ) {
         Ok(_) => panic!("expected otherwise() argument error"),
         Err(err) => assert!(
             err.to_string().contains("otherwise() requires an argument"),
@@ -1647,7 +1657,10 @@ fn describe_basic() {
         .into_iter()
         .map(|s| s.unwrap().to_string())
         .collect();
-    assert_eq!(stats, vec!["count", "null_count", "mean", "std", "min", "max"]);
+    assert_eq!(
+        stats,
+        vec!["count", "null_count", "mean", "std", "min", "max"]
+    );
 }
 
 #[test]
@@ -1669,7 +1682,10 @@ fn describe_mixed_dtypes() {
     assert!(result.column("int_col").is_ok());
     assert!(result.column("float_col").is_ok());
     assert!(result.column("str_col").is_err(), "str should be excluded");
-    assert!(result.column("bool_col").is_err(), "bool should be excluded");
+    assert!(
+        result.column("bool_col").is_err(),
+        "bool should be excluded"
+    );
 }
 
 #[test]
@@ -1677,7 +1693,7 @@ fn describe_with_array_dtype() {
     // Test with fixed-size array column (dtype-array feature)
     let arr1 = Series::new("".into(), &[1.0f64, 2.0, 3.0]);
     let arr2 = Series::new("".into(), &[4.0f64, 5.0, 6.0]);
-    
+
     let df = df! {
         "id" => &[1, 2],
         "value" => &[10.0, 20.0],
@@ -1706,11 +1722,15 @@ fn describe_no_numeric_columns() {
 
     let ctx = EvalContext::new().with_df("test", df);
     let result = run("test.describe()", &ctx);
-    
+
     match result {
         Err(e) => {
             let err = e.to_string();
-            assert!(err.contains("numeric"), "Error should mention numeric: {}", err);
+            assert!(
+                err.contains("numeric"),
+                "Error should mention numeric: {}",
+                err
+            );
         }
         Ok(_) => panic!("Should error with no numeric columns"),
     }
@@ -1749,14 +1769,8 @@ fn df_count_basic() {
     assert_eq!(df.height(), 1);
 
     // All columns should have count 3 (no nulls in test data)
-    assert_eq!(
-        df.column("name").unwrap().u32().unwrap().get(0).unwrap(),
-        3
-    );
-    assert_eq!(
-        df.column("gold").unwrap().u32().unwrap().get(0).unwrap(),
-        3
-    );
+    assert_eq!(df.column("name").unwrap().u32().unwrap().get(0).unwrap(), 3);
+    assert_eq!(df.column("gold").unwrap().u32().unwrap().get(0).unwrap(), 3);
 }
 
 #[test]

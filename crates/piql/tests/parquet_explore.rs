@@ -32,7 +32,11 @@ fn list_available_files() {
         let path = entry.path();
         if path.extension().map(|e| e == "parquet").unwrap_or(false) {
             let size = entry.metadata().unwrap().len();
-            println!("  {} ({:.1} MB)", path.file_name().unwrap().to_string_lossy(), size as f64 / 1_000_000.0);
+            println!(
+                "  {} ({:.1} MB)",
+                path.file_name().unwrap().to_string_lossy(),
+                size as f64 / 1_000_000.0
+            );
         }
     }
 }
@@ -56,7 +60,13 @@ fn inspect_slot_updates_schema() {
 
 #[test]
 fn inspect_all_schemas() {
-    let files = ["slot_updates", "tx_header", "tx_gas", "tx_perf", "block_perf"];
+    let files = [
+        "slot_updates",
+        "tx_header",
+        "tx_gas",
+        "tx_perf",
+        "block_perf",
+    ];
 
     for file in files {
         let path = parquet_path(file);

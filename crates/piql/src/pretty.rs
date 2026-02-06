@@ -14,9 +14,21 @@ impl Display for Literal {
         match self {
             Literal::String(s) => write!(f, "\"{}\"", escape_string(s)),
             Literal::Int(n) => write!(f, "{}", n),
-            Literal::Float(n) => write!(f, "{}", n),
-            Literal::Bool(b) => write!(f, "{}", b),
-            Literal::Null => write!(f, "null"),
+            Literal::Float(n) => {
+                if n.is_finite() && n.fract() == 0.0 {
+                    write!(f, "{n:.1}")
+                } else {
+                    write!(f, "{}", n)
+                }
+            }
+            Literal::Bool(b) => {
+                if *b {
+                    write!(f, "True")
+                } else {
+                    write!(f, "False")
+                }
+            }
+            Literal::Null => write!(f, "None"),
         }
     }
 }
@@ -392,6 +404,16 @@ mod tests {
                 "Round-trip failed for: {}",
                 q
             );
+        }
+    }
+
+    #[test]
+    fn literal_display_round_trip() {
+        for q in ["True", "False", "None", "1.0"] {
+            let expr = parse(q).unwrap();
+            let printed = expr.to_string();
+            let reparsed = parse(&printed).unwrap();
+            assert_eq!(expr, reparsed, "round trip failed for: {q}");
         }
     }
 }
